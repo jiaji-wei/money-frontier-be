@@ -1,0 +1,299 @@
+openapi: 3.1.0
+info:
+  title: Lili Ticket Backend API
+  version: "0.1.0"
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: auth
+  - name: tickets
+paths:
+  /health:
+    get:
+      tags: [auth]
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /signin/challenge:
+    post:
+      tags: [auth]
+      summary: Create one-time wallet login challenge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SigninChallengeRequest"
+      responses:
+        "200":
+          description: Challenge created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SigninChallengeResponse"
+
+  /signin:
+    post:
+      tags: [auth]
+      summary: Verify challenge signature and issue JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SigninVerifyRequest"
+      responses:
+        "200":
+          description: JWT issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SigninResponse"
+        "401":
+          description: Invalid or expired challenge, or invalid signature
+
+  /tickets:
+    get:
+      tags: [tickets]
+      summary: List active tickets of current wallet
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Ticket list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TicketView"
+        "401":
+          description: Unauthorized
+
+    post:
+      tags: [tickets]
+      summary: Notify backend to index on-chain purchase transaction
+      description: |
+        This endpoint accepts `chain_id + tx_hash`, then fetches and decodes
+        `TicketsPurchased` events from chain and writes tickets into DB.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NotifyRequest"
+      responses:
+        "200":
+          description: Index result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotifyResponse"
+        "400":
+          description: No valid purchase event in tx
+        "403":
+          description: Event buyer does not match current wallet
+        "401":
+          description: Unauthorized
+
+  /tickets/{id}:
+    get:
+      tags: [tickets]
+      summary: Get one active ticket by id for current wallet
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ticket detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TicketView"
+        "404":
+          description: Not found
+        "401":
+          description: Unauthorized
+
+    put:
+      tags: [tickets]
+      summary: Transfer ticket off-chain and rotate QR payload
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransferTicketRequest"
+      responses:
+        "200":
+          description: New owner active ticket
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TicketView"
+        "400":
+          description: Invalid transfer payload
+        "404":
+          description: Ticket not found
+        "401":
+          description: Unauthorized
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    SigninChallengeRequest:
+      type: object
+      required: [address]
+      properties:
+        address:
+          type: string
+          description: Wallet address in hex format
+          example: "0x1111111111111111111111111111111111111111"
+
+    SigninChallengeResponse:
+      type: object
+      required: [challenge_id, challenge_message, expires_at]
+      properties:
+        challenge_id:
+          type: string
+          format: uuid
+        challenge_message:
+          type: string
+        expires_at:
+          type: integer
+          format: int64
+          description: Unix seconds timestamp
+
+    SigninVerifyRequest:
+      type: object
+      required: [address, challenge_id, signature]
+      properties:
+        address:
+          type: string
+        challenge_id:
+          type: string
+          format: uuid
+        signature:
+          type: string
+          description: EIP-191 personal_sign signature
+
+    SigninResponse:
+      type: object
+      required: [wallet, token, expires_at]
+      properties:
+        wallet:
+          type: string
+        token:
+          type: string
+        expires_at:
+          type: integer
+          format: int64
+
+    NotifyRequest:
+      type: object
+      required: [chain_id, tx_hash]
+      properties:
+        chain_id:
+          type: integer
+          format: int64
+          example: 11155111
+        tx_hash:
+          type: string
+          example: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    NotifyResponse:
+      type: object
+      required: [indexed_orders, created_tickets]
+      properties:
+        indexed_orders:
+          type: integer
+        created_tickets:
+          type: integer
+
+    TransferTicketRequest:
+      type: object
+      properties:
+        to_wallet:
+          type: string
+          nullable: true
+        to_email:
+          type: string
+          format: email
+          nullable: true
+      description: Exactly one of `to_wallet` or `to_email` must be provided.
+
+    TicketView:
+      type: object
+      required:
+        - id
+        - chain_id
+        - order_id
+        - ticket_level
+        - unit_price
+        - qr_payload
+        - qr_version
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+        chain_id:
+          type: integer
+          format: int64
+        order_id:
+          type: string
+        owner_wallet:
+          type: string
+          nullable: true
+        owner_email:
+          type: string
+          nullable: true
+        ticket_level:
+          type: integer
+          format: int64
+        unit_price:
+          type: string
+        qr_payload:
+          type: string
+        qr_version:
+          type: integer
+          format: int64
+        status:
+          type: string
+        created_at:
+          type: integer
+          format: int64
+        updated_at:
+          type: integer
+          format: int64

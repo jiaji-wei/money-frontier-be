@@ -1,0 +1,4 @@
+.dev/
+backend/target/
+backend/*.db
+.DS_Store
