@@ -42,6 +42,28 @@ API 列表：
 ./scripts/dev-down.sh
 ```
 
+如果前端同学不安装 Rust，可使用预编译 backend（二进制）：
+
+```bash
+./scripts/dev-up-prebuilt.sh
+./scripts/dev-down.sh
+```
+
+后端同学可在本机打包预编译 backend（按平台）：
+
+```bash
+./scripts/package-frontend-kit.sh
+```
+
+默认本地联调固定参数（前端可直接使用）：
+* RPC: `http://127.0.0.1:8545`
+* Chain ID: `31337`
+* Backend: `http://127.0.0.1:8080`
+
+本地测试钱包（仅限本地 Anvil）：
+* Deployer: `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`
+* Buyer: `0x70997970C51812dc3A010C7d01b50e0d17dc79C8`
+
 生成文件位于：
 * `.dev/local/deploy-output.json`
 * `.dev/local/backend.env`

@@ -15,10 +15,15 @@ ANVIL_HOST="${ANVIL_HOST:-127.0.0.1}"
 ANVIL_PORT="${ANVIL_PORT:-8545}"
 ANVIL_CHAIN_ID="${ANVIL_CHAIN_ID:-31337}"
 ANVIL_RPC_URL="${ANVIL_RPC_URL:-http://${ANVIL_HOST}:${ANVIL_PORT}}"
+BACKEND_BIN="${BACKEND_BIN:-}"
 
 DEPLOYER_PRIVATE_KEY="${DEPLOYER_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 BUYER_PRIVATE_KEY="${BUYER_PRIVATE_KEY:-0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d}"
 LOCAL_NO_PROXY_SUFFIX="127.0.0.1,localhost"
+
+if [[ -n "${BACKEND_BIN}" && "${BACKEND_BIN}" != /* ]]; then
+  BACKEND_BIN="${ROOT_DIR}/${BACKEND_BIN}"
+fi
 
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 export NO_PROXY="${LOCAL_NO_PROXY_SUFFIX}${NO_PROXY:+,${NO_PROXY}}"
@@ -29,6 +34,18 @@ require_cmd() {
     echo "missing command: $1" >&2
     exit 1
   fi
+}
+
+require_backend_runtime() {
+  if [[ -n "${BACKEND_BIN}" ]]; then
+    if [[ ! -x "${BACKEND_BIN}" ]]; then
+      echo "backend binary is not executable: ${BACKEND_BIN}" >&2
+      exit 1
+    fi
+    return
+  fi
+
+  require_cmd cargo
 }
 
 process_alive() {
@@ -218,7 +235,11 @@ start_backend() {
     # shellcheck disable=SC1090
     source "${BACKEND_ENV_FILE}"
     set +a
-    cargo run
+    if [[ -n "${BACKEND_BIN}" ]]; then
+      "${BACKEND_BIN}"
+    else
+      cargo run
+    fi
   ) >"${BACKEND_LOG}" 2>&1 &
   local backend_pid=$!
   echo "${backend_pid}" > "${BACKEND_PID_FILE}"
@@ -253,13 +274,17 @@ print_summary() {
 
   cat <<EOF
 local test environment is ready
+rpc_note: use the rpc below in frontend wallet config
 rpc: ${ANVIL_RPC_URL}
+chain_id: ${ANVIL_CHAIN_ID}
 backend: http://127.0.0.1:8080
 ticket sale proxy: ${proxy}
 usdt: ${usdt}
 usdc: ${usdc}
 deployer: ${deployer_address}
 buyer: ${buyer_address}
+deployer_private_key (local only): ${DEPLOYER_PRIVATE_KEY}
+buyer_private_key (local only): ${BUYER_PRIVATE_KEY}
 
 generated files:
 - ${DEPLOY_OUTPUT_FILE}
@@ -277,8 +302,8 @@ main() {
   require_cmd anvil
   require_cmd forge
   require_cmd cast
-  require_cmd cargo
   require_cmd curl
+  require_backend_runtime
 
   start_anvil
   deploy_contracts

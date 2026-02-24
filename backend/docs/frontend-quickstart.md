@@ -244,12 +244,48 @@ Authorization: Bearer <jwt>
 
 ## 11. 联调命令（后端同学已提供）
 
-本地联调环境：
+### 11.1 本地联调环境（源码模式，需要 Rust）
 
 ```bash
 ./scripts/dev-up.sh
 ./scripts/dev-down.sh
 ```
+
+### 11.2 本地联调环境（预编译 backend，不需要 Rust）
+
+前提（前端机器）：
+
+- 已安装 Foundry（`anvil` / `forge` / `cast`）
+- 已安装 `curl`
+- 已拿到后端同学交付的预编译 binary（按你的系统架构）
+
+启动命令（推荐）：
+
+```bash
+./scripts/dev-up-prebuilt.sh
+./scripts/dev-down.sh
+```
+
+如果 binary 不在默认位置，也可以显式指定：
+
+```bash
+BACKEND_BIN=./dist/prebuilt/<platform>/ticket-backend ./scripts/dev-up.sh
+```
+
+### 11.3 本地固定联调参数（前端可直接使用）
+
+- RPC URL: `http://127.0.0.1:8545`
+- Chain ID: `31337`
+- Backend API: `http://127.0.0.1:8080`
+
+本地测试钱包（仅限本地 Anvil，禁止用于测试网/主网）：
+
+- Deployer
+  - Address: `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`
+  - Private Key: `0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80`
+- Buyer（脚本默认购票钱包）
+  - Address: `0x70997970C51812dc3A010C7d01b50e0d17dc79C8`
+  - Private Key: `0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d`
 
 用户流程测试脚本（可模拟真实用户操作）：
 
