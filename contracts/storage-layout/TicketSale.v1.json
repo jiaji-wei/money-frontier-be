@@ -1,0 +1,120 @@
+{
+  "storage": [
+    {
+      "astId": 1172,
+      "contract": "src/TicketSale.sol:TicketSale",
+      "label": "_price_schedules",
+      "offset": 0,
+      "slot": "0",
+      "type": "t_mapping(t_uint8,t_struct(PriceSchedule)1088_storage)"
+    },
+    {
+      "astId": 1176,
+      "contract": "src/TicketSale.sol:TicketSale",
+      "label": "payment_tokens",
+      "offset": 0,
+      "slot": "1",
+      "type": "t_mapping(t_address,t_bool)"
+    },
+    {
+      "astId": 1178,
+      "contract": "src/TicketSale.sol:TicketSale",
+      "label": "treasury",
+      "offset": 0,
+      "slot": "2",
+      "type": "t_address"
+    },
+    {
+      "astId": 1180,
+      "contract": "src/TicketSale.sol:TicketSale",
+      "label": "next_order_id",
+      "offset": 0,
+      "slot": "3",
+      "type": "t_uint256"
+    },
+    {
+      "astId": 1182,
+      "contract": "src/TicketSale.sol:TicketSale",
+      "label": "_reentrancy_lock",
+      "offset": 0,
+      "slot": "4",
+      "type": "t_uint256"
+    }
+  ],
+  "types": {
+    "t_address": {
+      "encoding": "inplace",
+      "label": "address",
+      "numberOfBytes": "20"
+    },
+    "t_array(t_uint256)dyn_storage": {
+      "encoding": "dynamic_array",
+      "label": "uint256[]",
+      "numberOfBytes": "32",
+      "base": "t_uint256"
+    },
+    "t_array(t_uint64)dyn_storage": {
+      "encoding": "dynamic_array",
+      "label": "uint64[]",
+      "numberOfBytes": "32",
+      "base": "t_uint64"
+    },
+    "t_bool": {
+      "encoding": "inplace",
+      "label": "bool",
+      "numberOfBytes": "1"
+    },
+    "t_mapping(t_address,t_bool)": {
+      "encoding": "mapping",
+      "key": "t_address",
+      "label": "mapping(address => bool)",
+      "numberOfBytes": "32",
+      "value": "t_bool"
+    },
+    "t_mapping(t_uint8,t_struct(PriceSchedule)1088_storage)": {
+      "encoding": "mapping",
+      "key": "t_uint8",
+      "label": "mapping(uint8 => struct TicketSale.PriceSchedule)",
+      "numberOfBytes": "32",
+      "value": "t_struct(PriceSchedule)1088_storage"
+    },
+    "t_struct(PriceSchedule)1088_storage": {
+      "encoding": "inplace",
+      "label": "struct TicketSale.PriceSchedule",
+      "numberOfBytes": "64",
+      "members": [
+        {
+          "astId": 1084,
+          "contract": "src/TicketSale.sol:TicketSale",
+          "label": "start_timestamps",
+          "offset": 0,
+          "slot": "0",
+          "type": "t_array(t_uint64)dyn_storage"
+        },
+        {
+          "astId": 1087,
+          "contract": "src/TicketSale.sol:TicketSale",
+          "label": "prices",
+          "offset": 0,
+          "slot": "1",
+          "type": "t_array(t_uint256)dyn_storage"
+        }
+      ]
+    },
+    "t_uint256": {
+      "encoding": "inplace",
+      "label": "uint256",
+      "numberOfBytes": "32"
+    },
+    "t_uint64": {
+      "encoding": "inplace",
+      "label": "uint64",
+      "numberOfBytes": "8"
+    },
+    "t_uint8": {
+      "encoding": "inplace",
+      "label": "uint8",
+      "numberOfBytes": "1"
+    }
+  }
+}

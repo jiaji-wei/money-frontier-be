@@ -41,8 +41,16 @@ docker compose down -v
 * 自动初始化价格配置并给默认买家授权
 * 启动 backend（`http://127.0.0.1:8080`）
 
-如果需要查看合约部署结果（容器共享运行时）：
-* 使用 `docker volume` 查看 `ticket_runtime` 卷内容
+前端需要的合约地址会输出到宿主机文件：
+* `.dev/docker/deploy-output.json`
+
+常用读取命令：
+
+```bash
+jq -r '.proxy' .dev/docker/deploy-output.json
+jq -r '.usdt' .dev/docker/deploy-output.json
+jq -r '.usdc' .dev/docker/deploy-output.json
+```
 
 已提供本地脚本（Anvil + 合约部署 + 后端启动）：
 

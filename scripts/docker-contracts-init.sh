@@ -77,7 +77,8 @@ main() {
     forge script script/LocalSetup.s.sol:LocalSetupScript \
       --rpc-url "${ANVIL_RPC_URL}" \
       --private-key "${DEPLOYER_PRIVATE_KEY}" \
-      --broadcast
+      --broadcast \
+      --non-interactive
   ) | tee "${LOCAL_SETUP_LOG_FILE}"
 
   usdt="$(extract_logged_address "local_usdt" "${LOCAL_SETUP_LOG_FILE}")"

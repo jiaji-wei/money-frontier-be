@@ -1,0 +1,165 @@
+name: Operations Checks
+
+permissions: {}
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "script/**"
+      - "scripts/**"
+      - "test/**"
+      - "foundry.toml"
+      - ".github/workflows/operations-checks.yml"
+  workflow_dispatch:
+
+env:
+  RPC_URL: http://127.0.0.1:8545
+  PRIVATE_KEY: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+  OWNER: 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
+  PAUSER: 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
+  PROXY_ADMIN_OWNER: 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
+  TREASURY: 0x0000000000000000000000000000000000001001
+  USDT_TOKEN: 0x0000000000000000000000000000000000001002
+  USDC_TOKEN: 0x0000000000000000000000000000000000001003
+
+jobs:
+  deploy-verify:
+    name: deploy-verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install dependencies
+        run: forge install OpenZeppelin/openzeppelin-contracts OpenZeppelin/openzeppelin-contracts-upgradeable --no-git
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Start anvil
+        run: nohup anvil --host 127.0.0.1 --port 8545 > /tmp/anvil.log 2>&1 &
+
+      - name: Deploy proxy
+        env:
+          DEPLOY_OUTPUT_FILE: /tmp/deploy.json
+        run: forge script script/TicketSale.s.sol:TicketSaleScript --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" --broadcast
+
+      - name: Verify deployment
+        run: |
+          DEPLOY_JSON=/tmp/deploy.json
+          export TICKET_SALE_PROXY="$(jq -r '.proxy' "$DEPLOY_JSON")"
+          export PROXY_ADMIN="$(jq -r '.proxy_admin' "$DEPLOY_JSON")"
+          export EXPECTED_IMPLEMENTATION="$(jq -r '.implementation' "$DEPLOY_JSON")"
+          export EXPECTED_DEFAULT_ADMIN="$(jq -r '.default_admin' "$DEPLOY_JSON")"
+          export EXPECTED_PAUSER="$(jq -r '.pauser' "$DEPLOY_JSON")"
+          export EXPECTED_TREASURY="$(jq -r '.treasury' "$DEPLOY_JSON")"
+          forge script script/VerifyTicketSaleUpgrade.s.sol:VerifyTicketSaleUpgradeScript --rpc-url "$RPC_URL"
+
+  upgrade-verify:
+    name: upgrade-verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install dependencies
+        run: forge install OpenZeppelin/openzeppelin-contracts OpenZeppelin/openzeppelin-contracts-upgradeable --no-git
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Start anvil
+        run: nohup anvil --host 127.0.0.1 --port 8545 > /tmp/anvil.log 2>&1 &
+
+      - name: Deploy proxy
+        env:
+          DEPLOY_OUTPUT_FILE: /tmp/deploy.json
+        run: forge script script/TicketSale.s.sol:TicketSaleScript --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" --broadcast
+
+      - name: Upgrade implementation
+        run: |
+          export TICKET_SALE_PROXY="$(jq -r '.proxy' /tmp/deploy.json)"
+          export PROXY_ADMIN="$(jq -r '.proxy_admin' /tmp/deploy.json)"
+          export UPGRADE_OUTPUT_FILE=/tmp/upgrade.json
+          forge script script/UpgradeTicketSale.s.sol:UpgradeTicketSaleScript --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" --broadcast
+
+      - name: Verify upgraded deployment
+        run: |
+          export TICKET_SALE_PROXY="$(jq -r '.proxy' /tmp/deploy.json)"
+          export PROXY_ADMIN="$(jq -r '.proxy_admin' /tmp/deploy.json)"
+          export EXPECTED_IMPLEMENTATION="$(jq -r '.active_implementation' /tmp/upgrade.json)"
+          export EXPECTED_DEFAULT_ADMIN="$(jq -r '.default_admin' /tmp/deploy.json)"
+          export EXPECTED_PAUSER="$(jq -r '.pauser' /tmp/deploy.json)"
+          export EXPECTED_TREASURY="$(jq -r '.treasury' /tmp/deploy.json)"
+          forge script script/VerifyTicketSaleUpgrade.s.sol:VerifyTicketSaleUpgradeScript --rpc-url "$RPC_URL"
+
+  governance-rotation-checklist:
+    name: governance-rotation-checklist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install dependencies
+        run: forge install OpenZeppelin/openzeppelin-contracts OpenZeppelin/openzeppelin-contracts-upgradeable --no-git
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Start anvil
+        run: nohup anvil --host 127.0.0.1 --port 8545 > /tmp/anvil.log 2>&1 &
+
+      - name: Deploy proxy
+        env:
+          DEPLOY_OUTPUT_FILE: /tmp/deploy.json
+        run: forge script script/TicketSale.s.sol:TicketSaleScript --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" --broadcast
+
+      - name: Rotate governance
+        run: |
+          export TICKET_SALE_PROXY="$(jq -r '.proxy' /tmp/deploy.json)"
+          export PROXY_ADMIN="$(jq -r '.proxy_admin' /tmp/deploy.json)"
+          export NEW_DEFAULT_ADMIN=0x70997970c51812dc3a010c7d01b50e0d17dc79c8
+          export NEW_PAUSER=0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc
+          export NEW_PROXY_ADMIN_OWNER=0x90f79bf6eb2c4f870365e785982e1f101e93b906
+          export OLD_DEFAULT_ADMIN="$OWNER"
+          export OLD_PAUSER="$PAUSER"
+          export ROTATE_OUTPUT_FILE=/tmp/rotate.json
+          forge script script/RotateGovernance.s.sol:RotateGovernanceScript --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" --broadcast
+
+      - name: Verify rotation checklist
+        run: |
+          PROXY="$(jq -r '.proxy' /tmp/rotate.json)"
+          PROXY_ADMIN="$(jq -r '.proxy_admin' /tmp/rotate.json)"
+          NEW_DEFAULT_ADMIN="$(jq -r '.new_default_admin' /tmp/rotate.json)"
+          NEW_PAUSER="$(jq -r '.new_pauser' /tmp/rotate.json)"
+          NEW_PROXY_ADMIN_OWNER="$(jq -r '.proxy_admin_owner' /tmp/rotate.json)"
+          DEFAULT_ADMIN_ROLE=0x0000000000000000000000000000000000000000000000000000000000000000
+          PAUSER_ROLE="$(cast keccak "PAUSER_ROLE")"
+
+          HAS_NEW_DEFAULT_ADMIN="$(cast call "$PROXY" "hasRole(bytes32,address)(bool)" "$DEFAULT_ADMIN_ROLE" "$NEW_DEFAULT_ADMIN" --rpc-url "$RPC_URL")"
+          HAS_OLD_DEFAULT_ADMIN="$(cast call "$PROXY" "hasRole(bytes32,address)(bool)" "$DEFAULT_ADMIN_ROLE" "$OWNER" --rpc-url "$RPC_URL")"
+          HAS_NEW_PAUSER="$(cast call "$PROXY" "hasRole(bytes32,address)(bool)" "$PAUSER_ROLE" "$NEW_PAUSER" --rpc-url "$RPC_URL")"
+          HAS_OLD_PAUSER="$(cast call "$PROXY" "hasRole(bytes32,address)(bool)" "$PAUSER_ROLE" "$PAUSER" --rpc-url "$RPC_URL")"
+          ACTUAL_PROXY_ADMIN_OWNER="$(cast call "$PROXY_ADMIN" "owner()(address)" --rpc-url "$RPC_URL")"
+
+          test "$HAS_NEW_DEFAULT_ADMIN" = "true"
+          test "$HAS_OLD_DEFAULT_ADMIN" = "false"
+          test "$HAS_NEW_PAUSER" = "true"
+          test "$HAS_OLD_PAUSER" = "false"
+          test "${ACTUAL_PROXY_ADMIN_OWNER,,}" = "${NEW_PROXY_ADMIN_OWNER,,}"

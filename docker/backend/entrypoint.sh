@@ -47,7 +47,11 @@ export INDEXER_BATCH_SIZE="${INDEXER_BATCH_SIZE:-200}"
 export INDEXER_REORG_ROLLBACK_BLOCKS="${INDEXER_REORG_ROLLBACK_BLOCKS:-32}"
 export SIGNIN_CLEANUP_INTERVAL_SECS="${SIGNIN_CLEANUP_INTERVAL_SECS:-600}"
 export SIGNIN_CLEANUP_RETENTION_SECS="${SIGNIN_CLEANUP_RETENTION_SECS:-86400}"
-export APP_CHAINS_JSON="${APP_CHAINS_JSON:-[{\"chain_id\":${ANVIL_CHAIN_ID},\"rpc_url\":\"${ANVIL_RPC_URL}\",\"sale_contract\":\"${PROXY_ADDR}\",\"start_block\":null,\"confirmations\":0}]}"
+if [ -z "${APP_CHAINS_JSON:-}" ]; then
+  APP_CHAINS_JSON="$(printf '[{"chain_id":%s,"rpc_url":"%s","sale_contract":"%s","start_block":null,"confirmations":0}]' \
+    "${ANVIL_CHAIN_ID}" "${ANVIL_RPC_URL}" "${PROXY_ADDR}")"
+fi
+export APP_CHAINS_JSON
 
 echo "backend runtime config"
 echo "  rpc: ${ANVIL_RPC_URL}"

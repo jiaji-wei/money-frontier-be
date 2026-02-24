@@ -265,10 +265,19 @@ docker compose down -v
 说明：
 
 - 会自动启动 Anvil、本地合约部署初始化、backend
+- 合约部署结果会写到宿主机：`.dev/docker/deploy-output.json`
 - 前端直接使用固定参数：
   - RPC URL: `http://127.0.0.1:8545`
   - Chain ID: `31337`
   - Backend API: `http://127.0.0.1:8080`
+
+前端读取地址（推荐）：
+
+```bash
+jq -r '.proxy' .dev/docker/deploy-output.json
+jq -r '.usdt' .dev/docker/deploy-output.json
+jq -r '.usdc' .dev/docker/deploy-output.json
+```
 
 ### 11.2 本地联调环境（源码模式，需要 Rust）
 
