@@ -244,14 +244,40 @@ Authorization: Bearer <jwt>
 
 ## 11. 联调命令（后端同学已提供）
 
-### 11.1 本地联调环境（源码模式，需要 Rust）
+### 11.1 本地联调环境（推荐：Docker Compose，不需要 Rust / Foundry）
+
+前提（前端机器）：
+
+- 已安装 Docker Desktop（或 Docker Engine + Compose）
+
+启动：
+
+```bash
+docker compose up --build
+```
+
+停止并清理（重置本地链与数据库）：
+
+```bash
+docker compose down -v
+```
+
+说明：
+
+- 会自动启动 Anvil、本地合约部署初始化、backend
+- 前端直接使用固定参数：
+  - RPC URL: `http://127.0.0.1:8545`
+  - Chain ID: `31337`
+  - Backend API: `http://127.0.0.1:8080`
+
+### 11.2 本地联调环境（源码模式，需要 Rust）
 
 ```bash
 ./scripts/dev-up.sh
 ./scripts/dev-down.sh
 ```
 
-### 11.2 本地联调环境（预编译 backend，不需要 Rust）
+### 11.3 本地联调环境（预编译 backend，不需要 Rust）
 
 前提（前端机器）：
 
@@ -272,7 +298,7 @@ Authorization: Bearer <jwt>
 BACKEND_BIN=./dist/prebuilt/<platform>/ticket-backend ./scripts/dev-up.sh
 ```
 
-### 11.3 本地固定联调参数（前端可直接使用）
+### 11.4 本地固定联调参数（前端可直接使用）
 
 - RPC URL: `http://127.0.0.1:8545`
 - Chain ID: `31337`

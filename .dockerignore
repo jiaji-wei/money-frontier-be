@@ -1,0 +1,11 @@
+.git
+.dev
+dist
+backend/target
+backend/ticket.dev.db
+contracts/.git
+contracts/lib
+contracts/broadcast
+contracts/cache
+contracts/out
+**/.DS_Store

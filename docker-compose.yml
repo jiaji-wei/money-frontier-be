@@ -1,0 +1,62 @@
+services:
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    command:
+      - anvil
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8545"
+      - --chain-id
+      - "31337"
+      - --block-time
+      - "1"
+    ports:
+      - "8545:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  contracts-init:
+    image: ghcr.io/foundry-rs/foundry:latest
+    depends_on:
+      anvil:
+        condition: service_healthy
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - ticket_runtime:/runtime
+    environment:
+      ANVIL_RPC_URL: http://anvil:8545
+      RUNTIME_DIR: /runtime
+    command: ["/bin/bash", "/workspace/scripts/docker-contracts-init.sh"]
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    depends_on:
+      anvil:
+        condition: service_healthy
+      contracts-init:
+        condition: service_completed_successfully
+    volumes:
+      - ticket_runtime:/runtime
+    environment:
+      ANVIL_RPC_URL: http://anvil:8545
+      ANVIL_CHAIN_ID: "31337"
+      RUNTIME_DIR: /runtime
+      BIND_ADDR: 0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  ticket_runtime:

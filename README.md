@@ -23,6 +23,27 @@ API 列表：
 
 ## 本地测试环境一键启动
 
+推荐给前端同学的方式（只需要 Docker Desktop）：
+
+```bash
+docker compose up --build
+```
+
+停止并清理（包含本地链/数据库卷）：
+
+```bash
+docker compose down -v
+```
+
+`docker compose` 会完成：
+* 启动本地 Anvil（`http://127.0.0.1:8545`）
+* 自动部署本地 Mock USDT/USDC 与 TicketSale 透明代理
+* 自动初始化价格配置并给默认买家授权
+* 启动 backend（`http://127.0.0.1:8080`）
+
+如果需要查看合约部署结果（容器共享运行时）：
+* 使用 `docker volume` 查看 `ticket_runtime` 卷内容
+
 已提供本地脚本（Anvil + 合约部署 + 后端启动）：
 
 ```bash

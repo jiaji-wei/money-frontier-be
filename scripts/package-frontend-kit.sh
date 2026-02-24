@@ -79,6 +79,7 @@ main() {
   chmod +x "${out_bin}"
 
   cp "${ROOT_DIR}/backend/docs/frontend-quickstart.md" "${docs_dir}/frontend-quickstart.md"
+  cp "${ROOT_DIR}/backend/docs/frontend-integration-guide.md" "${docs_dir}/frontend-integration-guide.md"
   cp "${ROOT_DIR}/backend/docs/openapi.yaml" "${docs_dir}/openapi.yaml"
 
   if [[ -f "${abi_src}" ]]; then
@@ -101,6 +102,11 @@ Local endpoints after startup:
   RPC: http://127.0.0.1:8545
   Chain ID: 31337
   Backend: http://127.0.0.1:8080
+
+Included docs:
+  docs/frontend-quickstart.md
+  docs/frontend-integration-guide.md
+  docs/openapi.yaml
 
 Test wallet (local only):
   Buyer address: 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
