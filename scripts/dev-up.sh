@@ -10,6 +10,8 @@ BACKEND_PID_FILE="${DEV_DIR}/backend.pid"
 DEPLOY_OUTPUT_FILE="${DEV_DIR}/deploy-output.json"
 BACKEND_ENV_FILE="${DEV_DIR}/backend.env"
 LOCAL_SETUP_LOG_FILE="${DEV_DIR}/local-setup.log"
+LOCAL_DB_FILE="${DEV_DIR}/ticket.dev.db"
+SESSION_FILE="${DEV_DIR}/user-session.json"
 
 ANVIL_HOST="${ANVIL_HOST:-127.0.0.1}"
 ANVIL_PORT="${ANVIL_PORT:-8545}"
@@ -19,6 +21,7 @@ BACKEND_BIN="${BACKEND_BIN:-}"
 
 DEPLOYER_PRIVATE_KEY="${DEPLOYER_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 BUYER_PRIVATE_KEY="${BUYER_PRIVATE_KEY:-0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d}"
+PURCHASE_SIGNER_PRIVATE_KEY="${PURCHASE_SIGNER_PRIVATE_KEY:-0x5de4111afa1a4b94908f8310312ac4f2ce02f8b84136e3af71f81f4f1f8dd38b}"
 LOCAL_NO_PROXY_SUFFIX="127.0.0.1,localhost"
 
 if [[ -n "${BACKEND_BIN}" && "${BACKEND_BIN}" != /* ]]; then
@@ -96,12 +99,17 @@ start_anvil() {
   fi
 
   echo "starting anvil on ${ANVIL_RPC_URL}"
-  anvil \
-    --host "${ANVIL_HOST}" \
-    --port "${ANVIL_PORT}" \
-    --chain-id "${ANVIL_CHAIN_ID}" \
-    --block-time 1 \
-    >"${ANVIL_LOG}" 2>&1 &
+  nohup env \
+    ANVIL_HOST="${ANVIL_HOST}" \
+    ANVIL_PORT="${ANVIL_PORT}" \
+    ANVIL_CHAIN_ID="${ANVIL_CHAIN_ID}" \
+    bash -lc '
+      exec anvil \
+        --host "${ANVIL_HOST}" \
+        --port "${ANVIL_PORT}" \
+        --chain-id "${ANVIL_CHAIN_ID}" \
+        --block-time 1
+    ' >"${ANVIL_LOG}" 2>&1 &
 
   local anvil_pid=$!
   echo "${anvil_pid}" > "${ANVIL_PID_FILE}"
@@ -111,12 +119,15 @@ start_anvil() {
 deploy_contracts() {
   local deployer_address
   local buyer_address
+  local purchase_signer_address
 
   deployer_address="$(cast wallet address --private-key "${DEPLOYER_PRIVATE_KEY}")"
   buyer_address="$(cast wallet address --private-key "${BUYER_PRIVATE_KEY}")"
+  purchase_signer_address="$(cast wallet address --private-key "${PURCHASE_SIGNER_PRIVATE_KEY}")"
 
   echo "deployer address: ${deployer_address}"
   echo "buyer address: ${buyer_address}"
+  echo "purchase signer address: ${purchase_signer_address}"
   echo "deploying local contracts"
 
   (
@@ -126,6 +137,7 @@ deploy_contracts() {
     PROXY_ADMIN_OWNER="${deployer_address}" \
     TREASURY="${deployer_address}" \
     BUYER="${buyer_address}" \
+    PURCHASE_SIGNER="${purchase_signer_address}" \
     forge script script/LocalSetup.s.sol:LocalSetupScript \
       --rpc-url "${ANVIL_RPC_URL}" \
       --private-key "${DEPLOYER_PRIVATE_KEY}" \
@@ -137,20 +149,22 @@ deploy_contracts() {
   local implementation
   local proxy
   local proxy_admin
+  local purchase_signer
 
   usdt="$(extract_logged_address "local_usdt" "${LOCAL_SETUP_LOG_FILE}")"
   usdc="$(extract_logged_address "local_usdc" "${LOCAL_SETUP_LOG_FILE}")"
   implementation="$(extract_logged_address "ticket_sale_implementation" "${LOCAL_SETUP_LOG_FILE}")"
   proxy="$(extract_logged_address "ticket_sale_proxy" "${LOCAL_SETUP_LOG_FILE}")"
   proxy_admin="$(extract_logged_address "ticket_sale_proxy_admin" "${LOCAL_SETUP_LOG_FILE}")"
+  purchase_signer="$(extract_logged_address "purchase_signer" "${LOCAL_SETUP_LOG_FILE}")"
 
-  if [[ -z "${usdt}" || -z "${usdc}" || -z "${implementation}" || -z "${proxy}" || -z "${proxy_admin}" ]]; then
+  if [[ -z "${usdt}" || -z "${usdc}" || -z "${implementation}" || -z "${proxy}" || -z "${proxy_admin}" || -z "${purchase_signer}" ]]; then
     echo "failed to parse deployment logs: ${LOCAL_SETUP_LOG_FILE}" >&2
     exit 1
   fi
 
   cat > "${DEPLOY_OUTPUT_FILE}" <<EOF
-{"usdt":"${usdt}","usdc":"${usdc}","implementation":"${implementation}","proxy":"${proxy}","proxy_admin":"${proxy_admin}"}
+{"usdt":"${usdt}","usdc":"${usdc}","implementation":"${implementation}","proxy":"${proxy}","proxy_admin":"${proxy_admin}","purchase_signer":"${purchase_signer}"}
 EOF
 
   if [[ ! -f "${DEPLOY_OUTPUT_FILE}" ]]; then
@@ -192,12 +206,16 @@ write_backend_env() {
     exit 1
   fi
 
+  rm -f "${LOCAL_DB_FILE}" "${LOCAL_DB_FILE}-shm" "${LOCAL_DB_FILE}-wal" "${SESSION_FILE:-}"
+
   cat > "${BACKEND_ENV_FILE}" <<EOF
 BIND_ADDR=0.0.0.0:8080
-DATABASE_URL=sqlite://ticket.dev.db
+DATABASE_URL=sqlite://${LOCAL_DB_FILE}
 JWT_SECRET=local-dev-secret
 JWT_TTL_DAYS=3650
 SIGNIN_CHALLENGE_TTL_SECS=300
+PURCHASE_INTENT_TTL_SECS=900
+PURCHASE_SIGNER_PRIVATE_KEY=${PURCHASE_SIGNER_PRIVATE_KEY}
 MAIL_FROM=noreply@tickets.local
 MAIL_PROVIDER=console
 MAIL_WEBHOOK_URL=
@@ -216,7 +234,17 @@ EOF
 }
 
 start_backend() {
-  touch "${ROOT_DIR}/backend/ticket.dev.db"
+  local run_backend_bin="${BACKEND_BIN}"
+  touch "${LOCAL_DB_FILE}"
+
+  if [[ -z "${run_backend_bin}" ]]; then
+    echo "building backend binary"
+    (
+      cd "${ROOT_DIR}/backend"
+      cargo build
+    ) >/dev/null
+    run_backend_bin="${ROOT_DIR}/backend/target/debug/ticket-backend"
+  fi
 
   if [[ -f "${BACKEND_PID_FILE}" ]]; then
     local existing_pid
@@ -229,18 +257,18 @@ start_backend() {
   fi
 
   echo "starting backend"
-  (
-    cd "${ROOT_DIR}/backend"
-    set -a
-    # shellcheck disable=SC1090
-    source "${BACKEND_ENV_FILE}"
-    set +a
-    if [[ -n "${BACKEND_BIN}" ]]; then
-      "${BACKEND_BIN}"
-    else
-      cargo run
-    fi
-  ) >"${BACKEND_LOG}" 2>&1 &
+  nohup env \
+    ROOT_DIR="${ROOT_DIR}" \
+    BACKEND_BIN="${run_backend_bin}" \
+    BACKEND_ENV_FILE="${BACKEND_ENV_FILE}" \
+    bash -lc '
+      cd "${ROOT_DIR}/backend"
+      set -a
+      # shellcheck disable=SC1090
+      source "${BACKEND_ENV_FILE}"
+      set +a
+      exec "${BACKEND_BIN}"
+    ' >"${BACKEND_LOG}" 2>&1 &
   local backend_pid=$!
   echo "${backend_pid}" > "${BACKEND_PID_FILE}"
 

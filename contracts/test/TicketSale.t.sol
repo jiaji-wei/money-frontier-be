@@ -7,8 +7,9 @@ import {ProxyAdmin} from "openzeppelin-contracts/contracts/proxy/transparent/Pro
 import {
     ITransparentUpgradeableProxy
 } from "openzeppelin-contracts/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+import {UnsafeUpgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
 import {TicketSale} from "../src/TicketSale.sol";
-import {TicketSaleProxy} from "../src/TicketSaleProxy.sol";
+import {IntentSigning} from "./mocks/IntentSigning.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {TicketSaleV2Mock} from "./mocks/TicketSaleV2Mock.sol";
 
@@ -21,10 +22,11 @@ contract TicketSaleTest is Test {
     address internal constant TREASURY = address(0xCAFE);
     address internal constant OTHER_TOKEN = address(0x1234);
     address internal constant PROXY_ADMIN_OWNER = address(0xA11CE);
+    uint256 internal constant PURCHASE_SIGNER_PK = uint256(keccak256("purchase-signer"));
     bytes32 internal constant ERC1967_ADMIN_SLOT = bytes32(uint256(keccak256("eip1967.proxy.admin")) - 1);
 
     TicketSale internal sale;
-    TicketSaleProxy internal proxy;
+    address internal proxy;
     MockERC20 internal usdt;
     MockERC20 internal usdc;
 
@@ -39,8 +41,8 @@ contract TicketSaleTest is Test {
         TicketSale implementation = new TicketSale();
         bytes memory init_data =
             abi.encodeCall(TicketSale.initialize, (address(this), address(this), TREASURY, payment_tokens));
-        proxy = new TicketSaleProxy(address(implementation), PROXY_ADMIN_OWNER, init_data);
-        sale = TicketSale(address(proxy));
+        proxy = UnsafeUpgrades.deployTransparentProxy(address(implementation), PROXY_ADMIN_OWNER, init_data);
+        sale = TicketSale(proxy);
 
         uint64[] memory level_1_times = new uint64[](2);
         uint256[] memory level_1_prices = new uint256[](2);
@@ -148,6 +150,72 @@ contract TicketSaleTest is Test {
         sale.purchase(address(usdt), levels, quantities);
     }
 
+    function test_PurchaseWithAuthorization_UsesDiscountedAmountAndMarksIntentConsumed() public {
+        vm.warp(1_500);
+
+        address purchase_signer = vm.addr(PURCHASE_SIGNER_PK);
+        sale.setPurchaseSigner(purchase_signer);
+
+        uint8[] memory levels = new uint8[](2);
+        uint256[] memory quantities = new uint256[](2);
+        levels[0] = 1;
+        levels[1] = 2;
+        quantities[0] = 1;
+        quantities[1] = 2;
+
+        bytes32 intent_id = keccak256("intent-1");
+        uint256 final_total_amount = 450e6;
+        uint64 expires_at = uint64(block.timestamp + 15 minutes);
+
+        bytes32 digest = IntentSigning.digest(
+            address(sale),
+            block.chainid,
+            BUYER,
+            address(usdt),
+            levels,
+            quantities,
+            intent_id,
+            final_total_amount,
+            expires_at
+        );
+        bytes32 signed_digest = IntentSigning.ethSignedDigest(digest);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(PURCHASE_SIGNER_PK, signed_digest);
+        bytes memory signature = abi.encodePacked(r, s, v);
+
+        vm.prank(BUYER);
+        (uint256 order_id, uint256 charged_amount) = sale.purchaseWithAuthorization(
+            address(usdt),
+            levels,
+            quantities,
+            intent_id,
+            final_total_amount,
+            expires_at,
+            signature
+        );
+
+        assertEq(order_id, 1);
+        assertEq(charged_amount, final_total_amount);
+        assertEq(usdt.balanceOf(TREASURY), final_total_amount);
+        assertTrue(sale.consumed_intents(intent_id));
+
+        vm.prank(BUYER);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TicketSale.IntentAlreadyConsumed.selector,
+                intent_id
+            )
+        );
+        sale.purchaseWithAuthorization(
+            address(usdt),
+            levels,
+            quantities,
+            intent_id,
+            final_total_amount,
+            expires_at,
+            signature
+        );
+    }
+
     function test_CurrentPrice_RevertBeforeScheduleStart() public {
         vm.warp(999);
         vm.expectRevert(abi.encodeWithSelector(TicketSale.PriceNotStarted.selector, uint8(1), uint64(999)));
@@ -172,7 +240,7 @@ contract TicketSaleTest is Test {
         ProxyAdmin proxy_admin = ProxyAdmin(_proxyAdminAddress(proxy));
         vm.prank(PROXY_ADMIN_OWNER);
         proxy_admin.upgradeAndCall(
-            ITransparentUpgradeableProxy(payable(address(proxy))), address(upgraded_implementation), bytes("")
+            ITransparentUpgradeableProxy(payable(proxy)), address(upgraded_implementation), bytes("")
         );
 
         assertEq(sale.next_order_id(), 2);
@@ -184,7 +252,7 @@ contract TicketSaleTest is Test {
         assertEq(total_amount_after, 200e6);
     }
 
-    function _proxyAdminAddress(TicketSaleProxy ticket_sale_proxy) internal view returns (address) {
-        return address(uint160(uint256(vm.load(address(ticket_sale_proxy), ERC1967_ADMIN_SLOT))));
+    function _proxyAdminAddress(address ticket_sale_proxy) internal view returns (address) {
+        return address(uint160(uint256(vm.load(ticket_sale_proxy, ERC1967_ADMIN_SLOT))));
     }
 }

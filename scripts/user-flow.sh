@@ -256,6 +256,8 @@ command_buy() {
   local levels_csv="1"
   local quantities_csv="1"
   local private_key="${DEFAULT_BUYER_PRIVATE_KEY}"
+  local discount_code=""
+  local referral_code=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -275,6 +277,14 @@ command_buy() {
         private_key="${2:-}"
         shift 2
         ;;
+      --discount)
+        discount_code="${2:-}"
+        shift 2
+        ;;
+      --referral)
+        referral_code="${2:-}"
+        shift 2
+        ;;
       *)
         echo "unknown option for buy: $1" >&2
         exit 1
@@ -285,19 +295,69 @@ command_buy() {
   local payment_token
   local levels_array
   local quantities_array
+  local token
+  local wallet
+  local intent_resp
+  local intent_id
+  local final_total_amount
+  local expires_at
+  local signature
   local tx_json
   local tx_hash
 
+  token="$(auth_token_or_fail)"
+  wallet="$(cast wallet address --private-key "${private_key}")"
   payment_token="$(resolve_payment_token "${payment_token_name}")"
   levels_array="$(csv_to_array_literal "${levels_csv}")"
   quantities_array="$(csv_to_array_literal "${quantities_csv}")"
 
+  intent_resp="$(
+    json_post "/purchase-intents" "$(
+      jq -nc \
+        --argjson chain_id "${CHAIN_ID}" \
+        --arg payment_token "${payment_token}" \
+        --argjson level_ids "${levels_array}" \
+        --argjson quantities "${quantities_array}" \
+        --arg discount_code "${discount_code}" \
+        --arg referral_code "${referral_code}" \
+        '{
+          chain_id: $chain_id,
+          payment_token: $payment_token,
+          level_ids: $level_ids,
+          quantities: $quantities
+        }
+        + (if ($discount_code | length) > 0 then {discount_code: $discount_code} else {} end)
+        + (if ($referral_code | length) > 0 then {referral_code: $referral_code} else {} end)'
+    )" "${token}"
+  )"
+  intent_id="$(jq -r '.intent_id // empty' <<< "${intent_resp}")"
+  final_total_amount="$(jq -r '.final_total_amount // empty' <<< "${intent_resp}")"
+  expires_at="$(jq -r '.expires_at // empty' <<< "${intent_resp}")"
+  signature="$(jq -r '.signature // empty' <<< "${intent_resp}")"
+
+  if [[ -z "${intent_id}" || -z "${final_total_amount}" || -z "${expires_at}" || -z "${signature}" ]]; then
+    echo "failed to parse purchase intent response" >&2
+    echo "${intent_resp}" >&2
+    exit 1
+  fi
+
+  cast send "${payment_token}" \
+    "approve(address,uint256)" \
+    "${SALE_CONTRACT}" \
+    "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" \
+    --rpc-url "${RPC_URL}" \
+    --private-key "${private_key}" >/dev/null
+
   tx_json="$(
     cast send "${SALE_CONTRACT}" \
-      "purchase(address,uint8[],uint256[])" \
+      "purchaseWithAuthorization(address,uint8[],uint256[],bytes32,uint256,uint64,bytes)" \
       "${payment_token}" \
       "${levels_array}" \
       "${quantities_array}" \
+      "${intent_id}" \
+      "${final_total_amount}" \
+      "${expires_at}" \
+      "${signature}" \
       --rpc-url "${RPC_URL}" \
       --private-key "${private_key}" \
       --json
@@ -310,8 +370,11 @@ command_buy() {
     exit 1
   fi
 
+  session_set "wallet" "${wallet}"
+  session_set "last_intent_id" "${intent_id}"
   session_set "last_tx_hash" "${tx_hash}"
   session_set "last_payment_token" "${payment_token}"
+  echo "purchase intent: ${intent_id}"
   echo "purchase tx sent: ${tx_hash}"
 }
 
@@ -427,6 +490,7 @@ Usage:
 Commands:
   signin [private_key]
   buy [--token usdt|usdc|0xToken] [--levels 1,2] [--quantities 1,1] [--private-key 0x...]
+      [--discount CODE] [--referral CODE]
   notify [tx_hash] [chain_id]
   list
   get <ticket_id>
@@ -437,7 +501,7 @@ Commands:
 
 Examples:
   ./scripts/user-flow.sh signin
-  ./scripts/user-flow.sh buy --token usdt --levels 1,2 --quantities 1,3
+  ./scripts/user-flow.sh buy --token usdt --levels 1,2 --quantities 1,3 --discount SAVE10
   ./scripts/user-flow.sh notify
   ./scripts/user-flow.sh list
   ./scripts/user-flow.sh transfer-email <ticket_id> receiver@example.com

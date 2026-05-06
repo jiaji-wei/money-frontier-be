@@ -138,7 +138,7 @@ mod tests {
     use super::sync_all_chains;
     use crate::{
         auth::JwtCodec,
-        chain::{ChainReader, ChainRuntimeConfig, DecodedPurchase},
+        chain::{ChainReader, ChainRuntimeConfig, DecodedPurchase, QuoteResult},
         config::AppConfig,
         db::Db,
         mailer::Mailer,
@@ -237,6 +237,15 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
+
+        async fn quote_purchase(
+            &self,
+            _chain_id: u64,
+            _level_ids: &[u8],
+            _quantities: &[u64],
+        ) -> anyhow::Result<QuoteResult> {
+            anyhow::bail!("quote purchase is not used by indexer tests")
+        }
     }
 
     async fn build_state(mock_chain: Arc<MockChain>) -> Arc<AppState> {
@@ -263,6 +272,8 @@ mod tests {
             signin_challenge_ttl_secs: 300,
             signin_cleanup_interval_secs: 600,
             signin_cleanup_retention_secs: 86400,
+            purchase_intent_ttl_secs: 900,
+            purchase_signer_private_key: None,
         };
 
         let jwt =
@@ -285,6 +296,7 @@ mod tests {
             chain: mock_chain as Arc<dyn ChainReader>,
             jwt,
             mailer,
+            purchase_signer: None,
         })
     }
 
@@ -314,6 +326,7 @@ mod tests {
                 level_ids: vec![1],
                 quantities: vec![1],
                 unit_prices: vec!["100".to_string()],
+                intent_id: None,
             }],
         );
 
@@ -362,6 +375,7 @@ mod tests {
                 level_ids: vec![1],
                 quantities: vec![1],
                 unit_prices: vec!["100".to_string()],
+                intent_id: None,
             }],
         );
 
@@ -391,6 +405,7 @@ mod tests {
                 level_ids: vec![1],
                 quantities: vec![1],
                 unit_prices: vec!["120".to_string()],
+                intent_id: None,
             }],
         );
 

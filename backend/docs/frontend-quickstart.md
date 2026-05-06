@@ -11,23 +11,28 @@
 
 前端最小可用流程：
 
-1. 钱包登录（签名换 JWT）
-2. 调用合约 `purchase(...)` 发起购票交易
-3. 用 `chain_id + tx_hash` 调后端 `POST /tickets` 同步票务
-4. 调后端 `GET /tickets` 展示票夹
-5. （可选）转赠 `PUT /tickets/:id`
+1. 捕获落地页 `?ref=CODE` 并暂存 referral code
+2. 钱包登录（签名换 JWT，可选带 `referral_code` 做首次绑定）
+3. 调后端 `POST /purchase-intents` 锁定报价，拿 `intent_id + signature`
+4. 检查 token allowance，不足则先 `approve`
+5. 调用合约 `purchaseWithAuthorization(...)` 发起购票交易
+6. 用 `chain_id + tx_hash` 调后端 `POST /tickets` 同步票务
+7. 调后端 `GET /tickets` 展示票夹
+8. （可选）转赠 `PUT /tickets/:id`
 
 ## 2. 核心认知（避免走偏）
 
 - 门票不是链上 NFT，**以后端票务记录为准**
 - 链上只负责：
   - 收款
-  - 价格规则
-  - 发 `TicketsPurchased` 事件
+  - 验证后端签发的购买授权
+  - 发购票事件（新流程为 `TicketsPurchasedWithIntent`）
 - 链下后端负责：
   - 票归属（钱包 / 邮箱）
   - 二维码 payload
   - 转赠后二维码轮换
+- referral 不是在 `POST /tickets` 里事后绑定，而是在首次登录或首次创建 intent 时绑定到钱包
+- discount 会影响实付金额，必须在购买前通过 `POST /purchase-intents` 锁定，不能等链上交易完成后再补
 
 ## 3. 前端接入所需配置
 
@@ -76,7 +81,8 @@
 {
   "address": "0x...",
   "challenge_id": "uuid",
-  "signature": "0x..."
+  "signature": "0x...",
+  "referral_code": "ALICE-01"
 }
 ```
 
@@ -85,6 +91,7 @@
 - `token`（JWT）
 - `wallet`
 - `expires_at`
+- `referral_binding`（可选，状态为 `bound | already_bound | invalid`）
 
 后续所有票务 API 请求都要带：
 
@@ -92,19 +99,63 @@
 Authorization: Bearer <jwt>
 ```
 
-## 5. 购票（链上）
+## 5. 购票（授权购买）
 
 ### 5.1 建议调用顺序
 
-1. `quote(level_ids, quantities)`（可选但强烈建议）
-2. 检查 token allowance
-3. `approve`（如果不足）
-4. `purchase(payment_token, level_ids, quantities)`
-5. 等待交易成功 receipt
-6. 调后端 `POST /tickets` 同步
-7. `GET /tickets` 刷新票夹
+1. 可选捕获 URL 里的 `referral_code`
+2. `POST /signin` 签发 JWT，并在 wallet 尚未绑定 referral 时尝试首次绑定
+3. `POST /purchase-intents`
+4. 检查 token allowance
+5. `approve`（如果不足）
+6. `purchaseWithAuthorization(payment_token, level_ids, quantities, intent_id, final_total_amount, expires_at, signature)`
+7. 等待交易成功 receipt
+8. 调后端 `POST /tickets` 同步
+9. `GET /tickets` 刷新票夹
 
-### 5.2 推荐接入的合约方法
+### 5.2 `POST /purchase-intents`
+
+请求：
+
+```json
+{
+  "chain_id": 56,
+  "payment_token": "0x...",
+  "level_ids": [1],
+  "quantities": [2],
+  "discount_code": "SAVE50",
+  "referral_code": "ALICE-01"
+}
+```
+
+说明：
+
+- `discount_code` 可选，用于锁定本次折扣报价
+- `referral_code` 可选，只在 wallet 尚未绑定 referral 时生效
+- 已绑定 wallet 再传 `referral_code` 会被忽略
+
+响应：
+
+```json
+{
+  "intent_id": "0x...",
+  "expires_at": 1760000000,
+  "original_total_amount": "200000000",
+  "discount_amount": "50000000",
+  "final_total_amount": "150000000",
+  "signature": "0x...",
+  "referral_binding_status": "bound"
+}
+```
+
+说明：
+
+- `intent_id` 要原样传给合约
+- `signature` 是后端对本次购买授权的签名
+- `final_total_amount` 是本次实际应付金额
+- `referral_binding_status` 仅在本次请求顺带处理 referral 首绑时返回
+
+### 5.3 推荐接入的合约方法
 
 只读：
 
@@ -114,11 +165,14 @@ Authorization: Bearer <jwt>
 
 写入：
 
-- `purchase(address payment_token, uint8[] level_ids, uint256[] quantities)`
+- `purchaseWithAuthorization(address payment_token, uint8[] level_ids, uint256[] quantities, bytes32 intent_id, uint256 final_total_amount, uint64 expires_at, bytes signature)`
 
-### 5.3 精度说明
+前端不要再直接调用旧的 `purchase(...)` 路径做正式购买；新流程需要 `intent_id + signature` 才能带 discount 并与后端安全对账。
+
+### 5.4 精度说明
 
 - USDT / USDC 通常是 `6 decimals`
+- 当前主仓 `contracts/script/LocalSetup.s.sol` 部署的 mock USDT / USDC 是 `18 decimals`，默认票价按 `e18` 配置
 - 合约与后端返回金额一般是整数（最小单位）
 - 前端展示时自己做格式化
 
@@ -138,8 +192,10 @@ Authorization: Bearer <jwt>
 用途：
 
 - 后端根据 `tx_hash` 读取链上 receipt
-- 解码 `TicketsPurchased` 事件
+- 解码 `TicketsPurchasedWithIntent` / `TicketsPurchased` 事件
 - 写入 `orders` / `tickets`
+- 确认 discount redemption
+- 写 referral / discount 快照
 
 成功响应示例：
 
@@ -200,17 +256,18 @@ Authorization: Bearer <jwt>
 
 ## 9. 前端最容易踩的坑（请先看）
 
-### 9.1 `POST /tickets` 返回 403，但票已经能查到
+### 9.1 `POST /tickets` 重复调用不会重复记账
 
-这在当前实现里可能发生，原因通常是：
+当前实现对同一笔交易的重复 notify 是幂等的：
 
-- 后台 indexer 已经先把这笔交易索引入库了
-- 你再调用 `POST /tickets` 时没有新增结果
+- 首次成功时通常返回：
+  - `indexed_orders = 1`
+  - `created_tickets >= 1`
+- 重复调用同一笔交易时通常返回：
+  - `indexed_orders = 0`
+  - `created_tickets = 0`
 
-前端处理建议（推荐）：
-
-- `POST /tickets` 后无论成功/失败，都执行一次 `GET /tickets`
-- 如果票已经出现，就按“同步成功”处理 UI
+前端仍然建议在 `POST /tickets` 后执行一次 `GET /tickets`，因为 UI 最终应以后端票夹结果为准。
 
 ### 9.2 登录钱包和购票钱包不一致
 
@@ -232,6 +289,8 @@ Authorization: Bearer <jwt>
 购票按钮建议状态：
 
 - `idle`
+- `signing_in`
+- `creating_intent`
 - `approving`
 - `purchasing`
 - `waiting_receipt`
@@ -348,6 +407,7 @@ const signin = await api.post("/signin", {
   address,
   challenge_id: challenge.challenge_id,
   signature,
+  referral_code: capturedReferralCode,
 });
 
 jwtStore.set(signin.token);
@@ -356,11 +416,41 @@ jwtStore.set(signin.token);
 ### 12.2 交易后同步
 
 ```ts
+const intent = await api.post(
+  "/purchase-intents",
+  {
+    chain_id: chainId,
+    payment_token: paymentToken,
+    level_ids: levelIds,
+    quantities,
+    discount_code: discountCode,
+    referral_code: capturedReferralCode,
+  },
+  { headers: { Authorization: `Bearer ${jwtStore.token}` } }
+);
+
+if (allowance < BigInt(intent.final_total_amount)) {
+  await writeContractAsync({
+    address: paymentToken,
+    abi: erc20Abi,
+    functionName: "approve",
+    args: [saleProxyAddress, BigInt(intent.final_total_amount)],
+  });
+}
+
 const txHash = await writeContractAsync({
   address: saleProxyAddress,
   abi: ticketSaleAbi,
-  functionName: "purchase",
-  args: [paymentToken, levelIds, quantities],
+  functionName: "purchaseWithAuthorization",
+  args: [
+    paymentToken,
+    levelIds,
+    quantities,
+    intent.intent_id,
+    BigInt(intent.final_total_amount),
+    BigInt(intent.expires_at),
+    intent.signature,
+  ],
 });
 
 await waitForTransactionReceipt({ hash: txHash });

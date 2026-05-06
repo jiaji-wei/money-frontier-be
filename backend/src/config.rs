@@ -38,6 +38,10 @@ fn default_signin_cleanup_retention_secs() -> i64 {
     86400
 }
 
+fn default_purchase_intent_ttl_secs() -> i64 {
+    900
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChainConfig {
     pub chain_id: u64,
@@ -70,6 +74,8 @@ pub struct AppConfig {
     pub signin_challenge_ttl_secs: i64,
     pub signin_cleanup_interval_secs: u64,
     pub signin_cleanup_retention_secs: i64,
+    pub purchase_intent_ttl_secs: i64,
+    pub purchase_signer_private_key: Option<String>,
 }
 
 impl AppConfig {
@@ -134,6 +140,11 @@ impl AppConfig {
             .ok()
             .and_then(|raw| raw.parse::<i64>().ok())
             .unwrap_or_else(default_signin_cleanup_retention_secs);
+        let purchase_intent_ttl_secs = env::var("PURCHASE_INTENT_TTL_SECS")
+            .ok()
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or_else(default_purchase_intent_ttl_secs);
+        let purchase_signer_private_key = env::var("PURCHASE_SIGNER_PRIVATE_KEY").ok();
 
         Ok(Self {
             bind_addr,
@@ -155,6 +166,8 @@ impl AppConfig {
             signin_challenge_ttl_secs,
             signin_cleanup_interval_secs,
             signin_cleanup_retention_secs,
+            purchase_intent_ttl_secs,
+            purchase_signer_private_key,
         })
     }
 }

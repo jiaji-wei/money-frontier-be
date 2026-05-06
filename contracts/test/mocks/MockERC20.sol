@@ -1,45 +1,24 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
-contract MockERC20 {
-    string public name;
-    string public symbol;
-    uint8 public immutable decimals;
+import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
+import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
 
-    mapping(address => uint256) public balanceOf;
-    mapping(address => mapping(address => uint256)) public allowance;
+contract MockERC20 is ERC20, Ownable {
+    uint8 private immutable _token_decimals;
 
-    constructor(string memory token_name, string memory token_symbol, uint8 token_decimals) {
-        name = token_name;
-        symbol = token_symbol;
-        decimals = token_decimals;
+    constructor(string memory token_name, string memory token_symbol, uint8 token_decimals)
+        ERC20(token_name, token_symbol)
+        Ownable(msg.sender)
+    {
+        _token_decimals = token_decimals;
     }
 
-    function mint(address to, uint256 amount) external {
-        balanceOf[to] += amount;
+    function decimals() public view override returns (uint8) {
+        return _token_decimals;
     }
 
-    function approve(address spender, uint256 amount) external returns (bool) {
-        allowance[msg.sender][spender] = amount;
-        return true;
-    }
-
-    function transfer(address to, uint256 amount) external returns (bool) {
-        _transfer(msg.sender, to, amount);
-        return true;
-    }
-
-    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
-        uint256 allowed = allowance[from][msg.sender];
-        if (allowed != type(uint256).max) {
-            allowance[from][msg.sender] = allowed - amount;
-        }
-        _transfer(from, to, amount);
-        return true;
-    }
-
-    function _transfer(address from, address to, uint256 amount) internal {
-        balanceOf[from] -= amount;
-        balanceOf[to] += amount;
+    function mint(address to, uint256 amount) external onlyOwner {
+        _mint(to, amount);
     }
 }

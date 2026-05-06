@@ -1,6 +1,15 @@
 .dev/
 dist/
 backend/target/
+backend/target-*/
+backend/.env*
+!backend/.env.example
 backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+contracts/.env*
+contracts/.tmp-*/
+!contracts/.env.example
+contracts/*-output.json
 .DS_Store
 .worktrees/

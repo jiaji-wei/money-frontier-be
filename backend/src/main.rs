@@ -6,11 +6,13 @@ mod db;
 mod error;
 mod indexer;
 mod mailer;
+mod promotions;
 mod routes;
 
 use std::sync::Arc;
 
 use axum::{routing::get, routing::post, Router};
+use ethers_signers::LocalWallet;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use auth::JwtCodec;
@@ -26,6 +28,7 @@ pub struct AppState {
     pub chain: Arc<dyn ChainReader>,
     pub jwt: JwtCodec,
     pub mailer: Mailer,
+    pub purchase_signer: Option<LocalWallet>,
 }
 
 #[tokio::main]
@@ -41,6 +44,11 @@ async fn main() -> anyhow::Result<()> {
     let db = Db::connect(&config.database_url).await?;
     let chain: Arc<dyn ChainReader> = Arc::new(ChainService::new(&config.chains)?);
     let jwt = JwtCodec::new(&config.jwt_secret, config.jwt_ttl_days)?;
+    let purchase_signer = config
+        .purchase_signer_private_key
+        .as_deref()
+        .map(str::parse::<LocalWallet>)
+        .transpose()?;
     let mailer = Mailer::new(
         config.mail_from.clone(),
         config.mail_provider.clone(),
@@ -58,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         chain,
         jwt,
         mailer,
+        purchase_signer,
     });
 
     indexer::spawn(state.clone());
@@ -67,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(routes::health))
         .route("/signin/challenge", post(routes::signin_challenge))
         .route("/signin", post(routes::signin_verify))
+        .route("/purchase-intents", post(routes::create_purchase_intent))
+        .route("/purchase-intents/:id", get(routes::get_purchase_intent))
         .route(
             "/tickets",
             get(routes::list_tickets).post(routes::notify_tickets),

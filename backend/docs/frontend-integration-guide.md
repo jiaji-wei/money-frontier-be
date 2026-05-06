@@ -3,7 +3,7 @@
 本文档面向前端开发，目标是帮助你完成以下接入：
 
 - 钱包登录（签名换 JWT）
-- 链上购票（调用 `TicketSale` 透明代理）
+- 链上购票（先创建 `purchase_intent`，再调用 `TicketSale` 授权购买）
 - 通知后端同步链上订单（`chain_id + tx_hash`）
 - 查询门票、查看门票详情
 - 门票转赠（钱包地址 / 邮箱）
@@ -19,10 +19,11 @@
 ### 1.1 职责划分
 
 - 智能合约：
-  - 负责售票、收款、价格规则、事件记录（`TicketsPurchased`）
+  - 负责售票、收款、价格规则、后端签名授权校验、事件记录
   - 不发 NFT / 不做链上票权转移
 - 后端：
   - 负责登录鉴权（钱包签名 + JWT）
+  - 负责 referral 首次绑定与 purchase intent 签发
   - 索引链上购票事件到 DB
   - 维护票务归属（钱包 / 邮箱）
   - 维护二维码 payload（转赠后轮换）
@@ -37,6 +38,8 @@
 - 二维码 payload 为长期有效字符串（直到该票再次转赠后被轮换）。
 - 支持按链配置（当前目标：ETH / BSC；先 Anvil + 测试网）。
 - 价格是配置项（含时间段价格），不需要前端自行计算业务规则。
+- referral 不是在 `POST /tickets` 事后绑定，而是在首次登录或首次创建 intent 时绑定到 wallet。
+- discount 会影响链上实付金额，必须在购买前通过 `POST /purchase-intents` 锁定。
 
 ## 2. 业务流程总览
 
@@ -57,9 +60,11 @@ sequenceDiagram
     FE->>BE: POST /signin
     BE-->>FE: JWT
 
-    FE->>C: quote(...) (optional read)
-    C-->>FE: total_amount + unit_prices
-    FE->>C: purchase(payment_token, level_ids, quantities)
+    FE->>BE: POST /purchase-intents
+    BE-->>FE: intent_id + final_total_amount + signature
+
+    FE->>C: approve(...) (optional)
+    FE->>C: purchaseWithAuthorization(payment_token, level_ids, quantities, intent_id, final_total_amount, expires_at, signature)
     C-->>FE: tx_hash (wallet tx receipt)
 
     FE->>BE: POST /tickets { chain_id, tx_hash } + JWT
@@ -68,7 +73,15 @@ sequenceDiagram
     BE-->>FE: ticket list
 ```
 
-### 2.2 转赠流程（链下）
+### 2.2 Referral / Discount 规则
+
+- referral code 可来自落地页 `?ref=CODE`，前端应先捕获并暂存。
+- `POST /signin` 可选带 `referral_code`；如果 wallet 尚未绑定 referral，后端会尝试首次绑定。
+- `POST /purchase-intents` 也可带 `referral_code`；作用仍然只是“未绑定 wallet 的首次绑定补救”。
+- `discount_code` 只能出现在 `POST /purchase-intents`，不能在 `POST /tickets` 事后补记。
+- `POST /tickets` 只根据链上事件 + intent 结果做确认，不接受可信的 referral / discount 输入。
+
+### 2.3 转赠流程（链下）
 
 - 转赠到钱包地址：
   - 前端调用 `PUT /tickets/:id`，传 `to_wallet`
@@ -107,7 +120,8 @@ Content-Type: application/json
 {
   "address": "0x...",
   "challenge_id": "uuid",
-  "signature": "0x..."
+  "signature": "0x...",
+  "referral_code": "ALICE-01"
 }
 ```
 
@@ -125,6 +139,13 @@ JWT 使用建议：
 Authorization: Bearer <jwt>
 ```
 
+如果用户是从 referral 链接进入站点：
+
+- 前端先解析 `?ref=` / `?referral=` / `?referral_code=`
+- 做标准化后暂存到本地状态或浏览器存储
+- 登录或创建 intent 时再带给后端
+- 一旦后端返回 `bound` / `already_bound`，前端应清掉本地待绑定 referral
+
 ### 3.2 售票页（链上交互）
 
 前端链上交互使用：
@@ -141,16 +162,17 @@ Authorization: Bearer <jwt>
 
 常用写方法：
 
-- `purchase(address payment_token, uint8[] level_ids, uint256[] quantities)`
+- `purchaseWithAuthorization(address payment_token, uint8[] level_ids, uint256[] quantities, bytes32 intent_id, uint256 final_total_amount, uint64 expires_at, bytes signature)`
 
 前端下单前建议：
 
-1. 调用 `quote` 展示预计总价
-2. 检查用户 token allowance（USDT/USDC）
-3. 如 allowance 不足，先发 `approve`
-4. 再发 `purchase`
-5. 等交易 receipt
-6. 调用后端 `POST /tickets` 同步票务
+1. 确保当前钱包已登录并持有 JWT
+2. 调用 `POST /purchase-intents`
+3. 检查用户 token allowance（USDT/USDC）
+4. 如 allowance 不足，先发 `approve`
+5. 再发 `purchaseWithAuthorization`
+6. 等交易 receipt
+7. 调用后端 `POST /tickets` 同步票务
 
 ### 3.3 票夹页（Ticket List / Detail）
 
@@ -239,7 +261,8 @@ OpenAPI 源文件：
 {
   "address": "0x1111111111111111111111111111111111111111",
   "challenge_id": "uuid",
-  "signature": "0x..."
+  "signature": "0x...",
+  "referral_code": "ALICE-01"
 }
 ```
 
@@ -249,11 +272,68 @@ OpenAPI 源文件：
 {
   "wallet": "0x1111111111111111111111111111111111111111",
   "token": "jwt-token",
-  "expires_at": 1739999999
+  "expires_at": 1739999999,
+  "referral_binding": {
+    "status": "bound",
+    "referral_code": "ALICE-01"
+  }
 }
 ```
 
-### 4.2 Ticket APIs
+说明：
+
+- `referral_code` 是可选字段
+- `referral_binding.status` 可能是：
+  - `bound`
+  - `already_bound`
+  - `invalid`
+
+### 4.2 Purchase Intent APIs
+
+#### `POST /purchase-intents`
+
+用途：
+
+- 锁定本次购买报价
+- 处理 discount 校验
+- 在 wallet 未绑定 referral 时补做首次绑定
+- 返回合约购买所需的 `intent_id + signature`
+
+请求：
+
+```json
+{
+  "chain_id": 56,
+  "payment_token": "0x0000000000000000000000000000000000001002",
+  "level_ids": [1],
+  "quantities": [2],
+  "discount_code": "SAVE50",
+  "referral_code": "ALICE-01"
+}
+```
+
+响应（200）：
+
+```json
+{
+  "intent_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "expires_at": 1760000000,
+  "original_total_amount": "200000000",
+  "discount_amount": "50000000",
+  "final_total_amount": "150000000",
+  "signature": "0x...",
+  "referral_binding_status": "bound"
+}
+```
+
+#### `GET /purchase-intents/{id}`
+
+用途：
+
+- 查询当前 wallet 自己的 intent 状态
+- 用于前端恢复购买流程或排查 intent 是否已确认
+
+### 4.3 Ticket APIs
 
 #### `GET /tickets`
 
@@ -297,9 +377,12 @@ OpenAPI 源文件：
 
 当前实现注意事项（重要）：
 
-- 当该交易已被后台 indexer 提前索引时，`POST /tickets` 可能返回 `403`（因为当前路由层把“无匹配可新增结果”与“buyer 不匹配”收口了）
-- 对前端而言，如果你确认订单已在票夹中出现，可以视为“已同步成功”
-- 更稳妥做法：
+- 同一笔交易可重复 notify，接口会幂等处理
+- 首次成功时通常 `indexed_orders > 0`
+- 重复 notify 同一笔交易时通常返回：
+  - `indexed_orders = 0`
+  - `created_tickets = 0`
+- 更稳妥做法仍然是：
   - `POST /tickets` 后立即 `GET /tickets`
   - 或直接轮询 `GET /tickets` 直到新票出现
 
@@ -335,13 +418,14 @@ OpenAPI 源文件：
 - 前端调用目标地址应为 **proxy address**
 - ABI 使用 `TicketSale.sol` 的 ABI（业务函数都在实现合约定义）
 
-### 5.2 关键事件：`TicketsPurchased`
+### 5.2 关键事件：`TicketsPurchasedWithIntent`
 
-后端索引依赖该事件，前端也可在 receipt 中读取做即时反馈。
+新购买流程下，后端索引优先依赖 `TicketsPurchasedWithIntent`。后端仍兼容旧版 `TicketsPurchased`，但前端正式路径应使用带 `intent_id` 的新事件。
 
 事件字段（简化）：
 
 - `order_id`
+- `intent_id`
 - `buyer`
 - `payment_token`
 - `total_amount`
@@ -358,7 +442,8 @@ OpenAPI 源文件：
 
 ### 5.3 价格与精度
 
-- USDT / USDC 常见为 `6` decimals（本地 mock 也是 `6`）
+- USDT / USDC 常见为 `6` decimals
+- 当前主仓 `contracts/script/LocalSetup.s.sol` 部署的 mock USDT / USDC 是 `18` decimals，默认票价按 `e18` 配置
 - 合约事件中的价格/金额以整数返回（字符串形式进入后端 API 响应）
 - 前端展示时自行做 decimal 格式化
 
@@ -390,7 +475,7 @@ OpenAPI 源文件：
 两条路径是幂等设计（DB 唯一键约束 + 去重逻辑），但前端会观察到以下现象：
 
 - `notify` 前票已出现（后台先索引）
-- `notify` 返回 403，但 `GET /tickets` 能看到票（当前实现行为）
+- `notify` 返回 200，但 `indexed_orders = 0`、`created_tickets = 0`
 
 前端处理建议：
 
@@ -419,8 +504,11 @@ OpenAPI 源文件：
   - jwt token
   - token expires_at
 - `purchase`
+  - referral code
+  - discount code
+  - intent_id
   - selected levels/quantities
-  - quote result
+  - quote result / final_total_amount
   - tx hash
   - tx status
   - notify status
@@ -431,6 +519,8 @@ OpenAPI 源文件：
 ### 7.2 购买按钮推荐状态机
 
 - `idle`
+- `signing_in`
+- `creating_intent`
 - `approving`（如需要）
 - `purchasing`
 - `waiting_receipt`
@@ -467,11 +557,13 @@ OpenAPI 源文件：
 ### 8.2 前端联调最常用验证清单
 
 1. 钱包登录成功，JWT 正常附带到后续请求
-2. `quote` 与 UI 展示总价一致
-3. `purchase` 成功后，`notify` + `list` 能看到新票
-4. 转赠到邮箱后，原票从当前钱包消失
-5. 转赠到钱包地址后，返回的新票 `owner_wallet` 正确
-6. 后端返回错误时，UI 有明确提示（而非静默失败）
+2. referral 链接被正确捕获，并在首次登录或首次 intent 时完成绑定
+3. `purchase-intent` 返回的 `final_total_amount`、折扣额与 UI 一致
+4. `purchaseWithAuthorization` 成功后，`notify` + `list` 能看到新票
+5. 重复调用 `POST /tickets` 不会重复记账
+6. 转赠到邮箱后，原票从当前钱包消失
+7. 转赠到钱包地址后，返回的新票 `owner_wallet` 正确
+8. 后端返回错误时，UI 有明确提示（而非静默失败）
 
 ## 9. 上线前需要前后端确认的接口清单（建议）
 
@@ -499,6 +591,7 @@ const signin = await api.post("/signin", {
   address,
   challenge_id: challenge.challenge_id,
   signature,
+  referral_code: capturedReferralCode,
 });
 
 setJwt(signin.token);
@@ -507,11 +600,41 @@ setJwt(signin.token);
 ### 10.2 购票后同步
 
 ```ts
+const intent = await api.post(
+  "/purchase-intents",
+  {
+    chain_id: chainId,
+    payment_token: paymentToken,
+    level_ids: levelIds,
+    quantities,
+    discount_code: discountCode,
+    referral_code: capturedReferralCode,
+  },
+  { headers: { Authorization: `Bearer ${jwt}` } }
+);
+
+if (allowance < BigInt(intent.final_total_amount)) {
+  await writeContractAsync({
+    address: paymentToken,
+    abi: erc20Abi,
+    functionName: "approve",
+    args: [saleProxyAddress, BigInt(intent.final_total_amount)],
+  });
+}
+
 const txHash = await writeContractAsync({
   address: saleProxyAddress,
   abi: ticketSaleAbi,
-  functionName: "purchase",
-  args: [paymentToken, levelIds, quantities],
+  functionName: "purchaseWithAuthorization",
+  args: [
+    paymentToken,
+    levelIds,
+    quantities,
+    intent.intent_id,
+    BigInt(intent.final_total_amount),
+    BigInt(intent.expires_at),
+    intent.signature,
+  ],
 });
 
 await waitForTransactionReceipt({ hash: txHash });
