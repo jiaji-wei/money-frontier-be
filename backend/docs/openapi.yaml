@@ -62,6 +62,54 @@ paths:
         "401":
           description: Invalid or expired challenge, or invalid signature
 
+  /purchase-intents:
+    post:
+      tags: [tickets]
+      summary: Create signed purchase intent with optional referral and discount
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePurchaseIntentRequest"
+      responses:
+        "200":
+          description: Purchase intent created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatePurchaseIntentResponse"
+        "400":
+          description: Invalid request, unsupported promotion, or quote failure
+        "401":
+          description: Unauthorized
+
+  /purchase-intents/{id}:
+    get:
+      tags: [tickets]
+      summary: Get one purchase intent owned by current wallet
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Purchase intent detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PurchaseIntentResponse"
+        "404":
+          description: Purchase intent not found
+        "401":
+          description: Unauthorized
+
   /tickets:
     get:
       tags: [tickets]
@@ -206,6 +254,10 @@ components:
         signature:
           type: string
           description: EIP-191 personal_sign signature
+        referral_code:
+          type: string
+          nullable: true
+          description: Optional referral code to bind on first successful signin
 
     SigninResponse:
       type: object
@@ -218,6 +270,132 @@ components:
         expires_at:
           type: integer
           format: int64
+        referral_binding:
+          allOf:
+            - $ref: "#/components/schemas/ReferralBindingStatus"
+          nullable: true
+
+    ReferralBindingStatus:
+      type: object
+      required: [status, referral_code]
+      properties:
+        status:
+          type: string
+          enum: [bound, already_bound, invalid]
+        referral_code:
+          type: string
+
+    CreatePurchaseIntentRequest:
+      type: object
+      required: [chain_id, payment_token, level_ids, quantities]
+      properties:
+        chain_id:
+          type: integer
+          format: int64
+        payment_token:
+          type: string
+          description: ERC20 payment token address
+        level_ids:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+        quantities:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        discount_code:
+          type: string
+          nullable: true
+        referral_code:
+          type: string
+          nullable: true
+          description: Optional first-bind referral code, ignored when wallet is already bound
+
+    CreatePurchaseIntentResponse:
+      type: object
+      required:
+        - intent_id
+        - expires_at
+        - original_total_amount
+        - discount_amount
+        - final_total_amount
+        - signature
+      properties:
+        intent_id:
+          type: string
+        expires_at:
+          type: integer
+          format: int64
+        original_total_amount:
+          type: string
+        discount_amount:
+          type: string
+        final_total_amount:
+          type: string
+        signature:
+          type: string
+        referral_binding_status:
+          type: string
+          nullable: true
+          enum: [bound, already_bound, invalid]
+
+    PurchaseIntentResponse:
+      type: object
+      required:
+        - id
+        - wallet_address
+        - chain_id
+        - payment_token
+        - level_ids_json
+        - quantities_json
+        - original_total_amount
+        - discount_amount
+        - final_total_amount
+        - expires_at
+        - status
+      properties:
+        id:
+          type: string
+        wallet_address:
+          type: string
+        chain_id:
+          type: integer
+          format: int64
+        payment_token:
+          type: string
+        level_ids_json:
+          type: string
+        quantities_json:
+          type: string
+        referral_code_id:
+          type: integer
+          format: int64
+          nullable: true
+        discount_code_id:
+          type: integer
+          format: int64
+          nullable: true
+        original_total_amount:
+          type: string
+        discount_amount:
+          type: string
+        final_total_amount:
+          type: string
+        expires_at:
+          type: integer
+          format: int64
+        status:
+          type: string
+        tx_hash:
+          type: string
+          nullable: true
+        order_id:
+          type: string
+          nullable: true
 
     NotifyRequest:
       type: object

@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
-use ethers::types::{Address, Signature};
+use ethers_core::types::{Address, Signature};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 

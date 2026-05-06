@@ -5,12 +5,18 @@ use axum::{
     http::HeaderMap,
     Json,
 };
+use ethers_core::types::U256;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::{extract_wallet, normalize_wallet_address, verify_wallet_signature},
+    config::ChainConfig,
     db::TicketRow,
     error::ApiError,
+    promotions::{
+        normalize_promotion_code, sign_purchase_authorization, DiscountRedemptionStatus,
+        NewDiscountRedemption, NewPurchaseIntent, PromotionCodeRow, PurchaseIntentStatus,
+    },
     AppState,
 };
 
@@ -53,6 +59,13 @@ pub struct SigninVerifyRequest {
     pub address: String,
     pub challenge_id: String,
     pub signature: String,
+    pub referral_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReferralBindingStatus {
+    pub status: String,
+    pub referral_code: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +73,47 @@ pub struct SigninResponse {
     pub wallet: String,
     pub token: String,
     pub expires_at: i64,
+    pub referral_binding: Option<ReferralBindingStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatePurchaseIntentRequest {
+    pub chain_id: u64,
+    pub payment_token: String,
+    pub level_ids: Vec<u8>,
+    pub quantities: Vec<u64>,
+    pub discount_code: Option<String>,
+    pub referral_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreatePurchaseIntentResponse {
+    pub intent_id: String,
+    pub expires_at: i64,
+    pub original_total_amount: String,
+    pub discount_amount: String,
+    pub final_total_amount: String,
+    pub signature: String,
+    pub referral_binding_status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PurchaseIntentResponse {
+    pub id: String,
+    pub wallet_address: String,
+    pub chain_id: i64,
+    pub payment_token: String,
+    pub level_ids_json: String,
+    pub quantities_json: String,
+    pub referral_code_id: Option<i64>,
+    pub discount_code_id: Option<i64>,
+    pub original_total_amount: String,
+    pub discount_amount: String,
+    pub final_total_amount: String,
+    pub expires_at: i64,
+    pub status: String,
+    pub tx_hash: Option<String>,
+    pub order_id: Option<String>,
 }
 
 pub async fn signin_verify(
@@ -84,12 +138,212 @@ pub async fn signin_verify(
         return Err(ApiError::unauthorized("invalid or expired challenge"));
     }
 
+    let referral_binding = match req
+        .referral_code
+        .as_deref()
+        .and_then(normalize_promotion_code)
+    {
+        Some(referral_code) => {
+            if state
+                .db
+                .get_wallet_referral_binding(&wallet)
+                .await
+                .map_err(|err| ApiError::internal(format!("load referral binding failed: {err}")))?
+                .is_some()
+            {
+                Some(ReferralBindingStatus {
+                    status: "already_bound".to_string(),
+                    referral_code,
+                })
+            } else {
+                let promotion_code =
+                    state
+                        .db
+                        .find_promotion_code(&referral_code)
+                        .await
+                        .map_err(|err| {
+                            ApiError::internal(format!("load referral code failed: {err}"))
+                        })?;
+
+                match promotion_code {
+                    Some(code) if code.kind == "referral" && code.status == "active" => {
+                        let bind_result = state
+                            .db
+                            .bind_wallet_referral_once(&wallet, code.id, "signin")
+                            .await
+                            .map_err(|err| {
+                                ApiError::internal(format!("bind referral failed: {err}"))
+                            })?;
+
+                        Some(ReferralBindingStatus {
+                            status: if bind_result.bound {
+                                "bound".to_string()
+                            } else {
+                                "already_bound".to_string()
+                            },
+                            referral_code: code.code_normalized,
+                        })
+                    }
+                    _ => Some(ReferralBindingStatus {
+                        status: "invalid".to_string(),
+                        referral_code,
+                    }),
+                }
+            }
+        }
+        None => None,
+    };
+
     let (token, expires_at) = state.jwt.issue(&wallet)?;
 
     Ok(Json(SigninResponse {
         wallet,
         token,
         expires_at,
+        referral_binding,
+    }))
+}
+
+pub async fn create_purchase_intent(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreatePurchaseIntentRequest>,
+) -> Result<Json<CreatePurchaseIntentResponse>, ApiError> {
+    let wallet = extract_wallet(&headers, &state.jwt)?;
+    validate_purchase_intent_request(&req)?;
+
+    let payment_token = normalize_wallet_address(&req.payment_token)?;
+    let chain_config = find_chain_config(&state.config.chains, req.chain_id)?;
+
+    let quote = state
+        .chain
+        .quote_purchase(req.chain_id, &req.level_ids, &req.quantities)
+        .await
+        .map_err(|err| ApiError::bad_request(format!("failed to quote purchase: {err}")))?;
+    let original_total = parse_u256_decimal(&quote.total_amount)?;
+
+    let (referral_code_id, referral_binding_status) =
+        resolve_purchase_referral_binding(&state, &wallet, req.referral_code.as_deref()).await?;
+
+    let (discount_code_id, discount_amount) = resolve_discount(
+        &state,
+        &wallet,
+        req.chain_id,
+        &req.level_ids,
+        req.discount_code.as_deref(),
+        referral_code_id.is_some(),
+        original_total,
+    )
+    .await?;
+
+    let final_total = original_total.saturating_sub(discount_amount);
+    let expires_at = unix_now() + state.config.purchase_intent_ttl_secs;
+    let signer = state
+        .purchase_signer
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("purchase signer not configured".to_string()))?;
+
+    let purchase_intent = state
+        .db
+        .create_purchase_intent(NewPurchaseIntent {
+            id: None,
+            wallet_address: wallet.clone(),
+            chain_id: req.chain_id as i64,
+            payment_token: payment_token.clone(),
+            level_ids_json: serde_json::to_string(&req.level_ids)
+                .map_err(|err| ApiError::internal(format!("serialize level ids failed: {err}")))?,
+            quantities_json: serde_json::to_string(&req.quantities)
+                .map_err(|err| ApiError::internal(format!("serialize quantities failed: {err}")))?,
+            referral_code_id,
+            discount_code_id,
+            original_total_amount: original_total.to_string(),
+            discount_amount: discount_amount.to_string(),
+            final_total_amount: final_total.to_string(),
+            expires_at,
+            status: PurchaseIntentStatus::Pending,
+            tx_hash: None,
+            order_id: None,
+        })
+        .await
+        .map_err(|err| ApiError::internal(format!("create purchase intent failed: {err}")))?;
+
+    if let Some(discount_code_id) = discount_code_id {
+        state
+            .db
+            .reserve_discount_redemption(NewDiscountRedemption {
+                purchase_intent_id: purchase_intent.id.clone(),
+                discount_code_id,
+                wallet_address: wallet.clone(),
+                status: DiscountRedemptionStatus::Reserved,
+                tx_hash: None,
+                order_id: None,
+                reserved_at: unix_now(),
+                confirmed_at: None,
+                released_at: None,
+            })
+            .await
+            .map_err(|err| ApiError::internal(format!("reserve discount failed: {err}")))?;
+    }
+
+    let signature = sign_purchase_authorization(
+        signer,
+        &chain_config.sale_contract,
+        req.chain_id,
+        &wallet,
+        &payment_token,
+        &req.level_ids,
+        &req.quantities,
+        &purchase_intent.id,
+        &purchase_intent.final_total_amount,
+        expires_at,
+    )
+    .await
+    .map_err(|err| ApiError::internal(format!("sign purchase authorization failed: {err}")))?;
+
+    Ok(Json(CreatePurchaseIntentResponse {
+        intent_id: purchase_intent.id,
+        expires_at,
+        original_total_amount: purchase_intent.original_total_amount,
+        discount_amount: purchase_intent.discount_amount,
+        final_total_amount: purchase_intent.final_total_amount,
+        signature,
+        referral_binding_status,
+    }))
+}
+
+pub async fn get_purchase_intent(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(intent_id): Path<String>,
+) -> Result<Json<PurchaseIntentResponse>, ApiError> {
+    let wallet = extract_wallet(&headers, &state.jwt)?;
+    let intent = state
+        .db
+        .get_purchase_intent(&intent_id)
+        .await
+        .map_err(|err| ApiError::internal(format!("load purchase intent failed: {err}")))?;
+
+    let intent = intent.ok_or_else(|| ApiError::not_found("purchase intent not found"))?;
+    if intent.wallet_address != wallet {
+        return Err(ApiError::not_found("purchase intent not found"));
+    }
+
+    Ok(Json(PurchaseIntentResponse {
+        id: intent.id,
+        wallet_address: intent.wallet_address,
+        chain_id: intent.chain_id,
+        payment_token: intent.payment_token,
+        level_ids_json: intent.level_ids_json,
+        quantities_json: intent.quantities_json,
+        referral_code_id: intent.referral_code_id,
+        discount_code_id: intent.discount_code_id,
+        original_total_amount: intent.original_total_amount,
+        discount_amount: intent.discount_amount,
+        final_total_amount: intent.final_total_amount,
+        expires_at: intent.expires_at,
+        status: intent.status,
+        tx_hash: intent.tx_hash,
+        order_id: intent.order_id,
     }))
 }
 
@@ -175,11 +429,13 @@ pub async fn notify_tickets(
 
     let mut indexed_orders = 0usize;
     let mut created_tickets = 0usize;
+    let mut matched_purchase = false;
 
     for purchase in &purchases {
         if purchase.buyer != wallet {
             continue;
         }
+        matched_purchase = true;
 
         let result = state
             .db
@@ -193,7 +449,7 @@ pub async fn notify_tickets(
         created_tickets += result.created_tickets;
     }
 
-    if indexed_orders == 0 && created_tickets == 0 {
+    if !matched_purchase {
         return Err(ApiError::forbidden(
             "no matching purchase event owned by current wallet",
         ));
@@ -282,6 +538,271 @@ fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
+fn validate_purchase_intent_request(req: &CreatePurchaseIntentRequest) -> Result<(), ApiError> {
+    if req.level_ids.is_empty() {
+        return Err(ApiError::bad_request("level_ids must not be empty"));
+    }
+    if req.level_ids.len() != req.quantities.len() {
+        return Err(ApiError::bad_request(
+            "level_ids and quantities length must match",
+        ));
+    }
+    if req.quantities.iter().any(|quantity| *quantity == 0) {
+        return Err(ApiError::bad_request(
+            "quantities must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_purchase_referral_binding(
+    state: &Arc<AppState>,
+    wallet: &str,
+    referral_code: Option<&str>,
+) -> Result<(Option<i64>, Option<String>), ApiError> {
+    if let Some(existing) = state
+        .db
+        .get_wallet_referral_binding(wallet)
+        .await
+        .map_err(|err| ApiError::internal(format!("load referral binding failed: {err}")))?
+    {
+        return Ok((
+            Some(existing.referral_code_id),
+            Some("already_bound".to_string()),
+        ));
+    }
+
+    let Some(referral_code) = referral_code.and_then(normalize_promotion_code) else {
+        return Ok((None, None));
+    };
+
+    let promotion_code = state
+        .db
+        .find_promotion_code(&referral_code)
+        .await
+        .map_err(|err| ApiError::internal(format!("load referral code failed: {err}")))?;
+
+    match promotion_code {
+        Some(code) if code.kind == "referral" && code.status == "active" => {
+            let bind_result = state
+                .db
+                .bind_wallet_referral_once(wallet, code.id, "purchase_intent")
+                .await
+                .map_err(|err| ApiError::internal(format!("bind referral failed: {err}")))?;
+            Ok((
+                Some(bind_result.referral_code_id),
+                Some(if bind_result.bound {
+                    "bound".to_string()
+                } else {
+                    "already_bound".to_string()
+                }),
+            ))
+        }
+        _ => Ok((None, Some("invalid".to_string()))),
+    }
+}
+
+async fn resolve_discount(
+    state: &Arc<AppState>,
+    wallet: &str,
+    chain_id: u64,
+    level_ids: &[u8],
+    discount_code: Option<&str>,
+    has_referral: bool,
+    original_total: U256,
+) -> Result<(Option<i64>, U256), ApiError> {
+    let Some(discount_code) = discount_code.and_then(normalize_promotion_code) else {
+        return Ok((None, U256::zero()));
+    };
+
+    let code = state
+        .db
+        .find_promotion_code(&discount_code)
+        .await
+        .map_err(|err| ApiError::internal(format!("load discount code failed: {err}")))?
+        .ok_or_else(|| ApiError::bad_request("discount code not found"))?;
+
+    validate_discount_code(state, wallet, chain_id, level_ids, has_referral, &code).await?;
+    let discount_amount = calculate_discount_amount(&code, original_total)?;
+    Ok((Some(code.id), discount_amount))
+}
+
+async fn validate_discount_code(
+    state: &Arc<AppState>,
+    wallet: &str,
+    chain_id: u64,
+    level_ids: &[u8],
+    has_referral: bool,
+    code: &PromotionCodeRow,
+) -> Result<(), ApiError> {
+    if code.kind != "discount" || code.status != "active" {
+        return Err(ApiError::bad_request("discount code is not active"));
+    }
+
+    let now = unix_now();
+    if code.valid_from.is_some_and(|value| value > now) {
+        return Err(ApiError::bad_request("discount code is not active yet"));
+    }
+    if code.valid_until.is_some_and(|value| value < now) {
+        return Err(ApiError::bad_request("discount code has expired"));
+    }
+    if has_referral
+        && code
+            .stacking_policy
+            .as_deref()
+            .is_some_and(|value| matches!(value, "exclusive" | "discount_only" | "no_referral"))
+    {
+        return Err(ApiError::bad_request(
+            "discount code cannot be combined with referral",
+        ));
+    }
+    if !scope_allows_chain(code.applicable_chain_ids.as_deref(), chain_id) {
+        return Err(ApiError::bad_request(
+            "discount code is not valid for this chain",
+        ));
+    }
+    if !scope_allows_levels(code.applicable_ticket_levels.as_deref(), level_ids) {
+        return Err(ApiError::bad_request(
+            "discount code is not valid for these ticket levels",
+        ));
+    }
+    if code.first_purchase_only {
+        let order_count = state
+            .db
+            .count_orders_by_wallet(wallet)
+            .await
+            .map_err(|err| ApiError::internal(format!("count wallet orders failed: {err}")))?;
+        if order_count > 0 {
+            return Err(ApiError::bad_request(
+                "discount code is only valid for first purchase",
+            ));
+        }
+    }
+    if let Some(max_total_uses) = code.max_total_uses {
+        let current_total = state
+            .db
+            .count_active_discount_redemptions(code.id)
+            .await
+            .map_err(|err| {
+                ApiError::internal(format!("count discount redemptions failed: {err}"))
+            })?;
+        if current_total >= max_total_uses {
+            return Err(ApiError::bad_request("discount code usage limit reached"));
+        }
+    }
+    if let Some(max_uses_per_wallet) = code.max_uses_per_wallet {
+        let current_wallet_uses = state
+            .db
+            .count_active_discount_redemptions_for_wallet(code.id, wallet)
+            .await
+            .map_err(|err| {
+                ApiError::internal(format!("count wallet discount redemptions failed: {err}"))
+            })?;
+        if current_wallet_uses >= max_uses_per_wallet {
+            return Err(ApiError::bad_request(
+                "discount code wallet usage limit reached",
+            ));
+        }
+    }
+    if code.discount_type.is_none() || code.discount_value.is_none() {
+        return Err(ApiError::bad_request("discount code is misconfigured"));
+    }
+
+    Ok(())
+}
+
+fn calculate_discount_amount(
+    code: &PromotionCodeRow,
+    original_total: U256,
+) -> Result<U256, ApiError> {
+    let discount_type = code
+        .discount_type
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("discount code is misconfigured"))?;
+    let discount_value = code
+        .discount_value
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("discount code is misconfigured"))?;
+
+    let mut discount_amount = match discount_type {
+        "fixed" => parse_u256_decimal(discount_value)?,
+        "percentage" => {
+            let bps = parse_u256_decimal(discount_value)?;
+            original_total
+                .checked_mul(bps)
+                .ok_or_else(|| ApiError::bad_request("discount calculation overflow"))?
+                / U256::from(10_000u64)
+        }
+        _ => return Err(ApiError::bad_request("unsupported discount type")),
+    };
+
+    if let Some(max_discount_amount) = code.max_discount_amount.as_deref() {
+        let max_discount_amount = parse_u256_decimal(max_discount_amount)?;
+        if discount_amount > max_discount_amount {
+            discount_amount = max_discount_amount;
+        }
+    }
+
+    if discount_amount > original_total {
+        discount_amount = original_total;
+    }
+
+    Ok(discount_amount)
+}
+
+fn parse_u256_decimal(value: &str) -> Result<U256, ApiError> {
+    U256::from_dec_str(value).map_err(|_| ApiError::bad_request("invalid decimal amount"))
+}
+
+fn find_chain_config<'a>(
+    chains: &'a [ChainConfig],
+    chain_id: u64,
+) -> Result<&'a ChainConfig, ApiError> {
+    chains
+        .iter()
+        .find(|cfg| cfg.chain_id == chain_id)
+        .ok_or_else(|| ApiError::bad_request("unsupported chain_id"))
+}
+
+fn parse_scope_u64(value: &str) -> Option<Vec<u64>> {
+    if let Ok(values) = serde_json::from_str::<Vec<u64>>(value) {
+        return Some(values);
+    }
+
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+
+    Some(values)
+}
+
+fn scope_allows_chain(scope: Option<&str>, chain_id: u64) -> bool {
+    match scope.and_then(parse_scope_u64) {
+        Some(values) => values.contains(&chain_id),
+        None => true,
+    }
+}
+
+fn scope_allows_levels(scope: Option<&str>, level_ids: &[u8]) -> bool {
+    match scope.and_then(parse_scope_u64) {
+        Some(values) => level_ids
+            .iter()
+            .all(|level| values.contains(&u64::from(*level))),
+        None => true,
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time should be after unix epoch")
+        .as_secs() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -296,18 +817,19 @@ mod tests {
         routing::{get, post},
         Router,
     };
-    use ethers::signers::{LocalWallet, Signer};
+    use ethers_signers::{LocalWallet, Signer};
     use serde_json::{json, Value};
     use tower::util::ServiceExt;
 
     use super::{
-        get_ticket, health, list_tickets, notify_tickets, signin_challenge, signin_verify,
-        transfer_ticket, validate_transfer_request, TransferTicketRequest,
+        create_purchase_intent, get_purchase_intent, get_ticket, health, list_tickets,
+        notify_tickets, signin_challenge, signin_verify, transfer_ticket,
+        validate_transfer_request, TransferTicketRequest,
     };
     use crate::{
         auth::JwtCodec,
-        chain::{ChainReader, ChainRuntimeConfig, DecodedPurchase},
-        config::AppConfig,
+        chain::{ChainReader, ChainRuntimeConfig, DecodedPurchase, QuoteResult},
+        config::{AppConfig, ChainConfig},
         db::Db,
         mailer::Mailer,
         AppState,
@@ -316,6 +838,7 @@ mod tests {
     #[derive(Default)]
     struct MockChainState {
         tx_events: HashMap<(u64, String), Vec<DecodedPurchase>>,
+        quotes: HashMap<(u64, Vec<u8>, Vec<u64>), QuoteResult>,
     }
 
     #[derive(Default)]
@@ -329,6 +852,19 @@ mod tests {
             guard
                 .tx_events
                 .insert((chain_id, tx_hash.to_string()), events);
+        }
+
+        fn set_quote(
+            &self,
+            chain_id: u64,
+            level_ids: &[u8],
+            quantities: &[u64],
+            quote: QuoteResult,
+        ) {
+            let mut guard = self.state.lock().expect("lock should succeed");
+            guard
+                .quotes
+                .insert((chain_id, level_ids.to_vec(), quantities.to_vec()), quote);
         }
     }
 
@@ -371,9 +907,35 @@ mod tests {
         ) -> anyhow::Result<Vec<DecodedPurchase>> {
             Ok(Vec::new())
         }
+
+        async fn quote_purchase(
+            &self,
+            chain_id: u64,
+            level_ids: &[u8],
+            quantities: &[u64],
+        ) -> anyhow::Result<QuoteResult> {
+            let guard = self.state.lock().expect("lock should succeed");
+            guard
+                .quotes
+                .get(&(chain_id, level_ids.to_vec(), quantities.to_vec()))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing quote response"))
+        }
     }
 
-    async fn build_test_app(mock_chain: Arc<MockChain>) -> Router {
+    fn build_test_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/health", get(health))
+            .route("/signin/challenge", post(signin_challenge))
+            .route("/signin", post(signin_verify))
+            .route("/purchase-intents", post(create_purchase_intent))
+            .route("/purchase-intents/:id", get(get_purchase_intent))
+            .route("/tickets", get(list_tickets).post(notify_tickets))
+            .route("/tickets/:id", get(get_ticket).put(transfer_ticket))
+            .with_state(state)
+    }
+
+    async fn build_test_app(mock_chain: Arc<MockChain>) -> (Router, Arc<AppState>) {
         let database_url = "sqlite::memory:".to_string();
         let db = Db::connect(&database_url)
             .await
@@ -392,17 +954,33 @@ mod tests {
             mail_retry_backoff_ms: 1,
             mail_alert_webhook_url: None,
             mail_alert_api_key: None,
-            chains: Vec::new(),
+            chains: vec![ChainConfig {
+                chain_id: 56,
+                rpc_url: "http://localhost:8545".to_string(),
+                sale_contract: "0x0000000000000000000000000000000000005000".to_string(),
+                start_block: None,
+                confirmations: 0,
+            }],
             indexer_poll_interval_secs: 5,
             indexer_batch_size: 50,
             indexer_reorg_rollback_blocks: 64,
             signin_challenge_ttl_secs: 300,
             signin_cleanup_interval_secs: 600,
             signin_cleanup_retention_secs: 86400,
+            purchase_intent_ttl_secs: 900,
+            purchase_signer_private_key: Some(
+                "0x8b3a350cf5c34c9194ca3a545d4d2ce7d9f69b17a3b2ecfacac4f2d0f6f7f204".to_string(),
+            ),
         };
 
         let jwt = JwtCodec::new(&config.jwt_secret, config.jwt_ttl_days)
             .expect("jwt init should succeed");
+        let purchase_signer = config
+            .purchase_signer_private_key
+            .as_deref()
+            .map(str::parse::<LocalWallet>)
+            .transpose()
+            .expect("purchase signer should parse");
         let mailer = Mailer::new(
             config.mail_from.clone(),
             config.mail_provider.clone(),
@@ -421,15 +999,10 @@ mod tests {
             chain: mock_chain as Arc<dyn ChainReader>,
             jwt,
             mailer,
+            purchase_signer,
         });
 
-        Router::new()
-            .route("/health", get(health))
-            .route("/signin/challenge", post(signin_challenge))
-            .route("/signin", post(signin_verify))
-            .route("/tickets", get(list_tickets).post(notify_tickets))
-            .route("/tickets/:id", get(get_ticket).put(transfer_ticket))
-            .with_state(state)
+        (build_test_router(state.clone()), state)
     }
 
     async fn json_request(
@@ -472,7 +1045,7 @@ mod tests {
     #[tokio::test]
     async fn e2e_signin_notify_and_transfer_flow() {
         let mock_chain = Arc::new(MockChain::default());
-        let app = build_test_app(mock_chain.clone()).await;
+        let (app, _state) = build_test_app(mock_chain.clone()).await;
 
         let wallet: LocalWallet =
             "0x59c6995e998f97a5a0044966f09453880a61fdbf87f6ea0f0f8a7ecf7f5f91f7"
@@ -548,6 +1121,7 @@ mod tests {
                 level_ids: vec![1],
                 quantities: vec![2],
                 unit_prices: vec!["100000000".to_string()],
+                intent_id: None,
             }],
         );
 
@@ -599,6 +1173,395 @@ mod tests {
             .as_array()
             .expect("ticket list expected");
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn signin_binds_referral_only_for_unbound_wallet() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain).await;
+
+        let first_code_id = state
+            .db
+            .seed_referral_code("alice")
+            .await
+            .expect("first code seed should succeed");
+        let second_code_id = state
+            .db
+            .seed_referral_code("bob")
+            .await
+            .expect("second code seed should succeed");
+
+        let wallet: LocalWallet =
+            "0x59c6995e998f97a5a0044966f09453880a61fdbf87f6ea0f0f8a7ecf7f5f91f7"
+                .parse()
+                .expect("wallet parse should succeed");
+        let wallet_address = format!("{:#x}", wallet.address());
+
+        let (status, first_challenge_body) = json_request(
+            &app,
+            Method::POST,
+            "/signin/challenge",
+            None,
+            Some(json!({ "address": wallet_address })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let first_challenge_id = first_challenge_body["challenge_id"]
+            .as_str()
+            .expect("first challenge id should exist");
+        let first_challenge_message = first_challenge_body["challenge_message"]
+            .as_str()
+            .expect("first challenge message should exist");
+
+        let first_signature = wallet
+            .sign_message(first_challenge_message.to_string())
+            .await
+            .expect("first message signing should succeed");
+
+        let (status, first_signin_body) = json_request(
+            &app,
+            Method::POST,
+            "/signin",
+            None,
+            Some(json!({
+                "address": wallet_address,
+                "challenge_id": first_challenge_id,
+                "signature": first_signature.to_string(),
+                "referral_code": "alice"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first_signin_body["wallet"], wallet_address);
+
+        let (status, second_challenge_body) = json_request(
+            &app,
+            Method::POST,
+            "/signin/challenge",
+            None,
+            Some(json!({ "address": wallet_address })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let second_challenge_id = second_challenge_body["challenge_id"]
+            .as_str()
+            .expect("second challenge id should exist");
+        let second_challenge_message = second_challenge_body["challenge_message"]
+            .as_str()
+            .expect("second challenge message should exist");
+
+        let second_signature = wallet
+            .sign_message(second_challenge_message.to_string())
+            .await
+            .expect("second message signing should succeed");
+
+        let (status, second_signin_body) = json_request(
+            &app,
+            Method::POST,
+            "/signin",
+            None,
+            Some(json!({
+                "address": wallet_address,
+                "challenge_id": second_challenge_id,
+                "signature": second_signature.to_string(),
+                "referral_code": "bob"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(second_signin_body["wallet"], wallet_address);
+
+        let binding = state
+            .db
+            .get_wallet_referral_binding(&wallet_address)
+            .await
+            .expect("binding lookup should succeed")
+            .expect("binding should exist");
+
+        assert_eq!(binding.referral_code_id, first_code_id);
+        assert_ne!(binding.referral_code_id, second_code_id);
+    }
+
+    #[tokio::test]
+    async fn create_purchase_intent_reserves_discount_and_uses_bound_referral() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain.clone()).await;
+
+        let referral_code_id = state
+            .db
+            .seed_referral_code("alice")
+            .await
+            .expect("referral code seed should succeed");
+        let discount_code_id = state
+            .db
+            .seed_fixed_discount_code("save50", "50000000")
+            .await
+            .expect("discount code seed should succeed");
+        mock_chain.set_quote(
+            56,
+            &[1],
+            &[2],
+            QuoteResult {
+                total_amount: "200000000".to_string(),
+                unit_prices: vec!["100000000".to_string()],
+            },
+        );
+
+        let wallet: LocalWallet =
+            "0x59c6995e998f97a5a0044966f09453880a61fdbf87f6ea0f0f8a7ecf7f5f91f7"
+                .parse()
+                .expect("wallet parse should succeed");
+        let wallet_address = format!("{:#x}", wallet.address());
+
+        let (status, challenge_body) = json_request(
+            &app,
+            Method::POST,
+            "/signin/challenge",
+            None,
+            Some(json!({ "address": wallet_address })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let challenge_id = challenge_body["challenge_id"]
+            .as_str()
+            .expect("challenge id should exist");
+        let challenge_message = challenge_body["challenge_message"]
+            .as_str()
+            .expect("challenge message should exist");
+
+        let signature = wallet
+            .sign_message(challenge_message.to_string())
+            .await
+            .expect("message signing should succeed");
+
+        let (status, signin_body) = json_request(
+            &app,
+            Method::POST,
+            "/signin",
+            None,
+            Some(json!({
+                "address": wallet_address,
+                "challenge_id": challenge_id,
+                "signature": signature.to_string(),
+                "referral_code": "alice"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = signin_body["token"]
+            .as_str()
+            .expect("token should exist")
+            .to_string();
+
+        let (status, intent_body) = json_request(
+            &app,
+            Method::POST,
+            "/purchase-intents",
+            Some(&token),
+            Some(json!({
+                "chain_id": 56,
+                "payment_token": "0x0000000000000000000000000000000000001002",
+                "level_ids": [1],
+                "quantities": [2],
+                "discount_code": "save50"
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(intent_body["referral_binding_status"], "already_bound");
+        assert_eq!(intent_body["original_total_amount"], "200000000");
+        assert_eq!(intent_body["discount_amount"], "50000000");
+        assert_eq!(intent_body["final_total_amount"], "150000000");
+        let intent_id = intent_body["intent_id"]
+            .as_str()
+            .expect("intent id should exist");
+        assert!(intent_body["signature"].as_str().is_some());
+
+        let intent = state
+            .db
+            .get_purchase_intent(intent_id)
+            .await
+            .expect("purchase intent lookup should succeed")
+            .expect("purchase intent should exist");
+        assert_eq!(intent.referral_code_id, Some(referral_code_id));
+        assert_eq!(intent.discount_code_id, Some(discount_code_id));
+
+        let redemption = state
+            .db
+            .get_discount_redemption(intent_id)
+            .await
+            .expect("discount redemption lookup should succeed")
+            .expect("discount redemption should exist");
+        assert_eq!(redemption.discount_code_id, discount_code_id);
+        assert_eq!(redemption.status, "reserved");
+    }
+
+    #[tokio::test]
+    async fn notify_tickets_confirms_discount_and_writes_snapshot_once() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain.clone()).await;
+
+        let referral_code_id = state
+            .db
+            .seed_referral_code("alice")
+            .await
+            .expect("referral code seed should succeed");
+        let discount_code_id = state
+            .db
+            .seed_fixed_discount_code("save50", "50000000")
+            .await
+            .expect("discount code seed should succeed");
+        mock_chain.set_quote(
+            56,
+            &[1],
+            &[2],
+            QuoteResult {
+                total_amount: "200000000".to_string(),
+                unit_prices: vec!["100000000".to_string()],
+            },
+        );
+
+        let wallet: LocalWallet =
+            "0x59c6995e998f97a5a0044966f09453880a61fdbf87f6ea0f0f8a7ecf7f5f91f7"
+                .parse()
+                .expect("wallet parse should succeed");
+        let wallet_address = format!("{:#x}", wallet.address());
+
+        let (status, challenge_body) = json_request(
+            &app,
+            Method::POST,
+            "/signin/challenge",
+            None,
+            Some(json!({ "address": wallet_address })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let challenge_id = challenge_body["challenge_id"]
+            .as_str()
+            .expect("challenge id should exist");
+        let challenge_message = challenge_body["challenge_message"]
+            .as_str()
+            .expect("challenge message should exist");
+
+        let signature = wallet
+            .sign_message(challenge_message.to_string())
+            .await
+            .expect("message signing should succeed");
+
+        let (status, signin_body) = json_request(
+            &app,
+            Method::POST,
+            "/signin",
+            None,
+            Some(json!({
+                "address": wallet_address,
+                "challenge_id": challenge_id,
+                "signature": signature.to_string(),
+                "referral_code": "alice"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = signin_body["token"]
+            .as_str()
+            .expect("token should exist")
+            .to_string();
+
+        let (status, intent_body) = json_request(
+            &app,
+            Method::POST,
+            "/purchase-intents",
+            Some(&token),
+            Some(json!({
+                "chain_id": 56,
+                "payment_token": "0x0000000000000000000000000000000000001002",
+                "level_ids": [1],
+                "quantities": [2],
+                "discount_code": "save50"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let intent_id = intent_body["intent_id"]
+            .as_str()
+            .expect("intent id should exist")
+            .to_string();
+
+        mock_chain.set_tx_events(
+            56,
+            "0xintenttx",
+            vec![DecodedPurchase {
+                tx_hash: "0xintenttx".to_string(),
+                log_index: 0,
+                block_number: 11,
+                block_hash: Some("0xblock11".to_string()),
+                order_id: "order-intent-1".to_string(),
+                buyer: wallet_address.clone(),
+                payment_token: "0x0000000000000000000000000000000000001002".to_string(),
+                total_amount: "150000000".to_string(),
+                level_ids: vec![1],
+                quantities: vec![2],
+                unit_prices: vec!["100000000".to_string()],
+                intent_id: Some(intent_id.clone()),
+            }],
+        );
+
+        let (status, notify_body) = json_request(
+            &app,
+            Method::POST,
+            "/tickets",
+            Some(&token),
+            Some(json!({
+                "chain_id": 56,
+                "tx_hash": "0xintenttx"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(notify_body["indexed_orders"], 1);
+        assert_eq!(notify_body["created_tickets"], 2);
+
+        let (status, second_notify_body) = json_request(
+            &app,
+            Method::POST,
+            "/tickets",
+            Some(&token),
+            Some(json!({
+                "chain_id": 56,
+                "tx_hash": "0xintenttx"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(second_notify_body["indexed_orders"], 0);
+        assert_eq!(second_notify_body["created_tickets"], 0);
+
+        let redemption = state
+            .db
+            .get_discount_redemption(&intent_id)
+            .await
+            .expect("discount redemption lookup should succeed")
+            .expect("discount redemption should exist");
+        assert_eq!(redemption.discount_code_id, discount_code_id);
+        assert_eq!(redemption.status, "confirmed");
+
+        let order_row_id = state
+            .db
+            .find_order_row_id(56, "0xintenttx", 0)
+            .await
+            .expect("order row id lookup should succeed")
+            .expect("order row id should exist");
+        let snapshot = state
+            .db
+            .get_order_promotions_snapshot(order_row_id)
+            .await
+            .expect("snapshot lookup should succeed")
+            .expect("snapshot should exist");
+        assert_eq!(snapshot.referral_code_id, Some(referral_code_id));
+        assert_eq!(snapshot.discount_code_id, Some(discount_code_id));
+        assert_eq!(snapshot.paid_amount, "150000000");
+        assert_eq!(snapshot.discount_amount, "50000000");
     }
 
     #[test]

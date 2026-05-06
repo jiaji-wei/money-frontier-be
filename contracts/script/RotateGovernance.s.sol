@@ -64,12 +64,12 @@ contract RotateGovernanceScript is Script {
 
         string memory output_file = vm.envOr("ROTATE_OUTPUT_FILE", string(""));
         if (bytes(output_file).length > 0) {
-            string memory json = "rotation";
-            json = vm.serializeAddress(json, "proxy", proxy);
-            json = vm.serializeAddress(json, "proxy_admin", proxy_admin);
-            json = vm.serializeAddress(json, "proxy_admin_owner", admin.owner());
-            json = vm.serializeAddress(json, "new_default_admin", new_default_admin);
-            json = vm.serializeAddress(json, "new_pauser", new_pauser);
+            string memory json_key = "rotation";
+            string memory json = vm.serializeAddress(json_key, "proxy", proxy);
+            json = vm.serializeAddress(json_key, "proxy_admin", proxy_admin);
+            json = vm.serializeAddress(json_key, "proxy_admin_owner", admin.owner());
+            json = vm.serializeAddress(json_key, "new_default_admin", new_default_admin);
+            json = vm.serializeAddress(json_key, "new_pauser", new_pauser);
             vm.writeJson(json, output_file);
             console2.log("rotate_output_file", output_file);
         }

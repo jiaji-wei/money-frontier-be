@@ -19,6 +19,7 @@ contract VerifyTicketSaleUpgradeScript is Script {
         address expected_admin = vm.envAddress("EXPECTED_DEFAULT_ADMIN");
         address expected_pauser = vm.envAddress("EXPECTED_PAUSER");
         address expected_treasury = vm.envAddress("EXPECTED_TREASURY");
+        address expected_purchase_signer = vm.envAddress("EXPECTED_PURCHASE_SIGNER");
 
         address actual_proxy_admin = _slotAddress(proxy, ERC1967_ADMIN_SLOT);
         address actual_implementation = _slotAddress(proxy, ERC1967_IMPLEMENTATION_SLOT);
@@ -30,6 +31,7 @@ contract VerifyTicketSaleUpgradeScript is Script {
         require(sale.hasRole(DEFAULT_ADMIN_ROLE, expected_admin), "default admin role missing");
         require(sale.hasRole(PAUSER_ROLE, expected_pauser), "pauser role missing");
         require(sale.treasury() == expected_treasury, "treasury mismatch");
+        require(sale.purchase_signer() == expected_purchase_signer, "purchase signer mismatch");
         require(sale.next_order_id() >= 1, "next_order_id invalid");
 
         console2.log("ticket_sale_proxy", proxy);
@@ -38,6 +40,7 @@ contract VerifyTicketSaleUpgradeScript is Script {
         console2.log("default_admin_verified", expected_admin);
         console2.log("pauser_verified", expected_pauser);
         console2.log("treasury_verified", expected_treasury);
+        console2.log("purchase_signer_verified", expected_purchase_signer);
         console2.log("next_order_id", sale.next_order_id());
     }
 

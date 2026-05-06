@@ -2,12 +2,11 @@ use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use ethers::{
-    abi::RawLog,
-    contract::EthEvent,
-    providers::{Http, Middleware, Provider},
-    types::{Address, BlockNumber, Filter, Log, H256, U256},
+use ethers_core::{
+    abi::{Function, Param, ParamType, RawLog, StateMutability, Token},
+    types::{Address, BlockNumber, Bytes, Filter, Log, TransactionRequest, H256, U256},
 };
+use ethers_providers::{Http, Middleware, Provider};
 
 use crate::config::ChainConfig;
 
@@ -24,6 +23,7 @@ pub struct DecodedPurchase {
     pub level_ids: Vec<u8>,
     pub quantities: Vec<u64>,
     pub unit_prices: Vec<String>,
+    pub intent_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +31,12 @@ pub struct ChainRuntimeConfig {
     pub chain_id: u64,
     pub start_block: Option<u64>,
     pub confirmations: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuoteResult {
+    pub total_amount: String,
+    pub unit_prices: Vec<String>,
 }
 
 #[async_trait]
@@ -49,6 +55,12 @@ pub trait ChainReader: Send + Sync {
         from_block: u64,
         to_block: u64,
     ) -> anyhow::Result<Vec<DecodedPurchase>>;
+    async fn quote_purchase(
+        &self,
+        chain_id: u64,
+        level_ids: &[u8],
+        quantities: &[u64],
+    ) -> anyhow::Result<QuoteResult>;
 }
 
 #[derive(Debug, Clone)]
@@ -64,7 +76,7 @@ pub struct ChainService {
     clients: HashMap<u64, ChainClient>,
 }
 
-#[derive(Clone, Debug, EthEvent)]
+#[derive(Clone, Debug, ethers_contract_derive::EthEvent)]
 #[ethevent(
     name = "TicketsPurchased",
     abi = "TicketsPurchased(uint256,address,address,uint256,uint8[],uint256[],uint256[],uint256)"
@@ -75,6 +87,26 @@ struct TicketsPurchasedLog {
     #[ethevent(indexed)]
     pub buyer: Address,
     #[ethevent(indexed)]
+    pub payment_token: Address,
+    pub total_amount: U256,
+    pub level_ids: Vec<u8>,
+    pub quantities: Vec<U256>,
+    pub unit_prices: Vec<U256>,
+    pub purchased_at: U256,
+}
+
+#[derive(Clone, Debug, ethers_contract_derive::EthEvent)]
+#[ethevent(
+    name = "TicketsPurchasedWithIntent",
+    abi = "TicketsPurchasedWithIntent(uint256,bytes32,address,address,uint256,uint8[],uint256[],uint256[],uint256)"
+)]
+struct TicketsPurchasedWithIntentLog {
+    #[ethevent(indexed)]
+    pub order_id: U256,
+    #[ethevent(indexed)]
+    pub intent_id: H256,
+    #[ethevent(indexed)]
+    pub buyer: Address,
     pub payment_token: Address,
     pub total_amount: U256,
     pub level_ids: Vec<u8>,
@@ -120,51 +152,142 @@ impl ChainService {
         if log.address != client.sale_contract {
             return Ok(None);
         }
-        if log.topics.first() != Some(&TicketsPurchasedLog::signature()) {
-            return Ok(None);
-        }
-
-        let decoded = <TicketsPurchasedLog as EthEvent>::decode_log(&RawLog {
-            topics: log.topics.clone(),
-            data: log.data.to_vec(),
-        })
-        .context("failed to decode TicketsPurchased log")?;
-
-        if decoded.level_ids.len() != decoded.quantities.len()
-            || decoded.level_ids.len() != decoded.unit_prices.len()
-        {
-            anyhow::bail!("event line-item lengths mismatch");
-        }
-
-        let mut quantities = Vec::with_capacity(decoded.quantities.len());
-        for quantity in &decoded.quantities {
-            quantities.push(u256_to_u64(*quantity).context("quantity exceeds u64 range")?);
-        }
-
-        let unit_prices = decoded
-            .unit_prices
-            .iter()
-            .map(|v: &U256| v.to_string())
-            .collect::<Vec<_>>();
-
         let tx_hash = log
             .transaction_hash
             .map(|v| format!("{v:#x}"))
             .unwrap_or_else(|| format!("{:#x}", H256::zero()));
+        let log_index = log.log_index.unwrap_or_default().as_u64();
+        let block_number = log.block_number.unwrap_or_default().as_u64();
+        let block_hash = log.block_hash.map(|v| format!("{v:#x}"));
+        let raw_log = RawLog {
+            topics: log.topics.clone(),
+            data: log.data.to_vec(),
+        };
 
-        Ok(Some(DecodedPurchase {
-            tx_hash,
-            log_index: log.log_index.unwrap_or_default().as_u64(),
-            block_number: log.block_number.unwrap_or_default().as_u64(),
-            block_hash: log.block_hash.map(|v| format!("{v:#x}")),
-            order_id: decoded.order_id.to_string(),
-            buyer: format!("{:#x}", decoded.buyer),
-            payment_token: format!("{:#x}", decoded.payment_token),
-            total_amount: decoded.total_amount.to_string(),
-            level_ids: decoded.level_ids,
-            quantities,
+        if log.topics.first()
+            == Some(&<TicketsPurchasedLog as ethers_contract::EthEvent>::signature())
+        {
+            let decoded = <TicketsPurchasedLog as ethers_contract::EthEvent>::decode_log(&raw_log)
+                .context("failed to decode TicketsPurchased log")?;
+            return build_decoded_purchase(
+                tx_hash,
+                log_index,
+                block_number,
+                block_hash,
+                decoded.order_id,
+                decoded.buyer,
+                decoded.payment_token,
+                decoded.total_amount,
+                decoded.level_ids,
+                decoded.quantities,
+                decoded.unit_prices,
+                None,
+            );
+        }
+
+        if log.topics.first()
+            == Some(&<TicketsPurchasedWithIntentLog as ethers_contract::EthEvent>::signature())
+        {
+            let decoded =
+                <TicketsPurchasedWithIntentLog as ethers_contract::EthEvent>::decode_log(&raw_log)
+                    .context("failed to decode TicketsPurchasedWithIntent log")?;
+            return build_decoded_purchase(
+                tx_hash,
+                log_index,
+                block_number,
+                block_hash,
+                decoded.order_id,
+                decoded.buyer,
+                decoded.payment_token,
+                decoded.total_amount,
+                decoded.level_ids,
+                decoded.quantities,
+                decoded.unit_prices,
+                Some(format!("{:#x}", decoded.intent_id)),
+            );
+        }
+
+        Ok(None)
+    }
+
+    async fn quote_purchase_via_rpc(
+        &self,
+        chain_id: u64,
+        level_ids: &[u8],
+        quantities: &[u64],
+    ) -> anyhow::Result<QuoteResult> {
+        let client = self.client(chain_id)?;
+        #[allow(deprecated)]
+        let function = Function {
+            name: "quote".to_string(),
+            inputs: vec![
+                Param {
+                    name: "level_ids".to_string(),
+                    kind: ParamType::Array(Box::new(ParamType::Uint(8))),
+                    internal_type: None,
+                },
+                Param {
+                    name: "quantities".to_string(),
+                    kind: ParamType::Array(Box::new(ParamType::Uint(256))),
+                    internal_type: None,
+                },
+            ],
+            outputs: vec![
+                Param {
+                    name: "total_amount".to_string(),
+                    kind: ParamType::Uint(256),
+                    internal_type: None,
+                },
+                Param {
+                    name: "unit_prices".to_string(),
+                    kind: ParamType::Array(Box::new(ParamType::Uint(256))),
+                    internal_type: None,
+                },
+            ],
+            constant: None,
+            state_mutability: StateMutability::View,
+        };
+
+        let calldata = function.encode_input(&[
+            Token::Array(
+                level_ids
+                    .iter()
+                    .map(|value| Token::Uint(U256::from(*value)))
+                    .collect(),
+            ),
+            Token::Array(
+                quantities
+                    .iter()
+                    .map(|value| Token::Uint(U256::from(*value)))
+                    .collect(),
+            ),
+        ])?;
+
+        let tx = TransactionRequest::new()
+            .to(client.sale_contract)
+            .data(Bytes::from(calldata));
+        let raw = client.provider.call(&tx.into(), None).await?;
+        let decoded = function.decode_output(raw.as_ref())?;
+
+        let total_amount = match &decoded[0] {
+            Token::Uint(value) => value.to_string(),
+            _ => anyhow::bail!("quote total_amount has unexpected type"),
+        };
+        let unit_prices = match &decoded[1] {
+            Token::Array(values) => values
+                .iter()
+                .map(|value| match value {
+                    Token::Uint(amount) => Ok(amount.to_string()),
+                    _ => anyhow::bail!("quote unit_price has unexpected type"),
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            _ => anyhow::bail!("quote unit_prices has unexpected type"),
+        };
+
+        Ok(QuoteResult {
+            total_amount,
             unit_prices,
-        }))
+        })
     }
 }
 
@@ -239,13 +362,20 @@ impl ChainReader for ChainService {
             return Ok(Vec::new());
         }
 
-        let filter = Filter::new()
+        let base_filter = Filter::new()
             .address(client.sale_contract)
             .from_block(BlockNumber::Number(from_block.into()))
-            .to_block(BlockNumber::Number(to_block.into()))
-            .topic0(TicketsPurchasedLog::signature());
+            .to_block(BlockNumber::Number(to_block.into()));
 
-        let logs = client.provider.get_logs(&filter).await?;
+        let legacy_filter = base_filter
+            .clone()
+            .topic0(<TicketsPurchasedLog as ethers_contract::EthEvent>::signature());
+        let intent_filter = base_filter
+            .clone()
+            .topic0(<TicketsPurchasedWithIntentLog as ethers_contract::EthEvent>::signature());
+
+        let mut logs = client.provider.get_logs(&legacy_filter).await?;
+        logs.extend(client.provider.get_logs(&intent_filter).await?);
         let mut purchases = Vec::with_capacity(logs.len());
         for log in logs {
             if let Some(decoded) = self.decode_purchase_log(client, &log)? {
@@ -256,6 +386,16 @@ impl ChainReader for ChainService {
         purchases.sort_by_key(|item| (item.block_number, item.log_index));
         Ok(purchases)
     }
+
+    async fn quote_purchase(
+        &self,
+        chain_id: u64,
+        level_ids: &[u8],
+        quantities: &[u64],
+    ) -> anyhow::Result<QuoteResult> {
+        self.quote_purchase_via_rpc(chain_id, level_ids, quantities)
+            .await
+    }
 }
 
 fn u256_to_u64(value: U256) -> anyhow::Result<u64> {
@@ -263,4 +403,48 @@ fn u256_to_u64(value: U256) -> anyhow::Result<u64> {
         anyhow::bail!("value out of u64 range")
     }
     Ok(value.as_u64())
+}
+
+fn build_decoded_purchase(
+    tx_hash: String,
+    log_index: u64,
+    block_number: u64,
+    block_hash: Option<String>,
+    order_id: U256,
+    buyer: Address,
+    payment_token: Address,
+    total_amount: U256,
+    level_ids: Vec<u8>,
+    quantities: Vec<U256>,
+    unit_prices: Vec<U256>,
+    intent_id: Option<String>,
+) -> anyhow::Result<Option<DecodedPurchase>> {
+    if level_ids.len() != quantities.len() || level_ids.len() != unit_prices.len() {
+        anyhow::bail!("event line-item lengths mismatch");
+    }
+
+    let mut decoded_quantities = Vec::with_capacity(quantities.len());
+    for quantity in &quantities {
+        decoded_quantities.push(u256_to_u64(*quantity).context("quantity exceeds u64 range")?);
+    }
+
+    let decoded_unit_prices = unit_prices
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+
+    Ok(Some(DecodedPurchase {
+        tx_hash,
+        log_index,
+        block_number,
+        block_hash,
+        order_id: order_id.to_string(),
+        buyer: format!("{:#x}", buyer),
+        payment_token: format!("{:#x}", payment_token),
+        total_amount: total_amount.to_string(),
+        level_ids,
+        quantities: decoded_quantities,
+        unit_prices: decoded_unit_prices,
+        intent_id,
+    }))
 }
