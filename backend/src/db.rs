@@ -6,6 +6,7 @@ use sqlx::{sqlite::SqlitePoolOptions, FromRow, QueryBuilder, SqlitePool};
 use uuid::Uuid;
 
 use crate::chain::DecodedPurchase;
+use crate::config::payment_token_decimals;
 use crate::promotions::{
     normalize_promotion_code, normalize_wallet_key, DiscountRedemptionRow,
     DiscountRedemptionStatus, NewDiscountRedemption, NewOrderPromotionsSnapshot, NewPurchaseIntent,
@@ -185,9 +186,13 @@ struct SettlementSourceRow {
     invite_code_id: i64,
     invite_code: String,
     beneficiary_wallet: Option<String>,
+    chain_id: i64,
+    payment_token: String,
     paid_amount: String,
     commission_base_amount: String,
     commission_amount: String,
+    commission_type: Option<String>,
+    commission_value: Option<String>,
 }
 
 struct ReferralSettlementAccumulator {
@@ -1914,10 +1919,15 @@ ExpiresAt: {expires_at}"
                 pc.id AS invite_code_id,
                 pc.code_normalized AS invite_code,
                 pc.beneficiary_wallet AS beneficiary_wallet,
+                o.chain_id AS chain_id,
+                o.payment_token AS payment_token,
                 ops.paid_amount AS paid_amount,
                 ops.commission_base_amount AS commission_base_amount,
-                ops.commission_amount AS commission_amount
+                ops.commission_amount AS commission_amount,
+                pc.commission_type AS commission_type,
+                pc.commission_value AS commission_value
             FROM order_promotions_snapshot ops
+            JOIN orders o ON o.id = ops.order_row_id
             JOIN promotion_codes pc ON pc.id = ops.referral_code_id
             WHERE pc.kind = 'referral'
             ORDER BY pc.code_normalized ASC
@@ -1940,10 +1950,22 @@ ExpiresAt: {expires_at}"
                 }
             });
 
+            let commission_base_amount = U256::from_dec_str(&row.commission_base_amount)?;
+            let mut commission_amount = U256::from_dec_str(&row.commission_amount)?;
+            if commission_amount.is_zero() {
+                commission_amount = calculate_commission_amount_from_rule(
+                    row.commission_type.as_deref(),
+                    row.commission_value.as_deref(),
+                    row.chain_id as u64,
+                    &row.payment_token,
+                    commission_base_amount,
+                )?;
+            }
+
             entry.confirmed_order_count += 1;
             entry.paid_amount_total += U256::from_dec_str(&row.paid_amount)?;
-            entry.commission_base_amount_total += U256::from_dec_str(&row.commission_base_amount)?;
-            entry.commission_amount_total += U256::from_dec_str(&row.commission_amount)?;
+            entry.commission_base_amount_total += commission_base_amount;
+            entry.commission_amount_total += commission_amount;
         }
 
         let mut output = grouped
@@ -2362,6 +2384,16 @@ ExpiresAt: {expires_at}"
                         .await?;
                     }
 
+                    let commission_base_amount = U256::from_dec_str(&purchase.total_amount)?;
+                    let commission_amount = calculate_referral_commission_amount(
+                        &mut tx,
+                        intent.referral_code_id,
+                        chain_id,
+                        &purchase.payment_token,
+                        commission_base_amount,
+                    )
+                    .await?;
+
                     sqlx::query(
                         r#"
                         INSERT OR IGNORE INTO order_promotions_snapshot (
@@ -2387,7 +2419,7 @@ ExpiresAt: {expires_at}"
                     .bind(intent.discount_amount)
                     .bind(&purchase.total_amount)
                     .bind(&purchase.total_amount)
-                    .bind("0")
+                    .bind(commission_amount.to_string())
                     .bind("v1")
                     .bind(now_ts)
                     .execute(&mut *tx)
@@ -2890,6 +2922,118 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("time should be after unix epoch")
         .as_secs() as i64
+}
+
+async fn calculate_referral_commission_amount(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    referral_code_id: Option<i64>,
+    chain_id: u64,
+    payment_token: &str,
+    commission_base_amount: U256,
+) -> anyhow::Result<U256> {
+    let Some(referral_code_id) = referral_code_id else {
+        return Ok(U256::zero());
+    };
+
+    let Some((commission_type, commission_value)) =
+        sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT commission_type, commission_value
+            FROM promotion_codes
+            WHERE id = ?1
+              AND kind = 'referral'
+            "#,
+        )
+        .bind(referral_code_id)
+        .fetch_optional(&mut **tx)
+        .await?
+    else {
+        return Ok(U256::zero());
+    };
+
+    let (Some(commission_type), Some(commission_value)) = (commission_type, commission_value)
+    else {
+        return Ok(U256::zero());
+    };
+
+    calculate_commission_amount_from_rule(
+        Some(&commission_type),
+        Some(&commission_value),
+        chain_id,
+        payment_token,
+        commission_base_amount,
+    )
+}
+
+fn calculate_commission_amount_from_rule(
+    commission_type: Option<&str>,
+    commission_value: Option<&str>,
+    chain_id: u64,
+    payment_token: &str,
+    commission_base_amount: U256,
+) -> anyhow::Result<U256> {
+    let (Some(commission_type), Some(commission_value)) = (commission_type, commission_value)
+    else {
+        return Ok(U256::zero());
+    };
+
+    let mut commission_amount = match commission_type {
+        "percentage" => {
+            let bps = U256::from_dec_str(commission_value)?;
+            commission_base_amount
+                .checked_mul(bps)
+                .ok_or_else(|| anyhow::anyhow!("commission calculation overflow"))?
+                / U256::from(10_000u64)
+        }
+        "fixed" => parse_human_token_amount(
+            commission_value,
+            payment_token_decimals(chain_id, payment_token),
+        )?,
+        _ => U256::zero(),
+    };
+
+    if commission_amount > commission_base_amount {
+        commission_amount = commission_base_amount;
+    }
+
+    Ok(commission_amount)
+}
+
+fn parse_human_token_amount(value: &str, decimals: Option<u8>) -> anyhow::Result<U256> {
+    let decimals =
+        decimals.ok_or_else(|| anyhow::anyhow!("payment token decimals are required"))?;
+    let normalized = value.trim();
+    if normalized.is_empty() || normalized.starts_with('-') {
+        return Err(anyhow::anyhow!("invalid decimal amount"));
+    }
+
+    let mut parts = normalized.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some() {
+        return Err(anyhow::anyhow!("invalid decimal amount"));
+    }
+    if !whole.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(anyhow::anyhow!("invalid decimal amount"));
+    }
+
+    let whole_amount = U256::from_dec_str(if whole.is_empty() { "0" } else { whole })?;
+    let base = U256::from(10u64).pow(U256::from(decimals));
+    let mut amount = whole_amount
+        .checked_mul(base)
+        .ok_or_else(|| anyhow::anyhow!("token amount overflow"))?;
+
+    if let Some(fraction) = fraction {
+        if fraction.len() > decimals as usize || !fraction.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err(anyhow::anyhow!("invalid decimal amount"));
+        }
+        let padded_fraction = format!("{fraction:0<width$}", width = decimals as usize);
+        if !padded_fraction.is_empty() {
+            amount += U256::from_dec_str(&padded_fraction)?;
+        }
+    }
+
+    Ok(amount)
 }
 
 #[cfg(test)]

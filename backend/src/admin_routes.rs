@@ -1284,7 +1284,7 @@ mod tests {
         auth::JwtCodec,
         chain::{ChainReader, ChainRuntimeConfig, DecodedPurchase, QuoteResult},
         config::AppConfig,
-        db::Db,
+        db::{Db, UpdateInviteCode},
         mailer::Mailer,
         promotions::{
             DiscountRedemptionStatus, NewDiscountRedemption, NewOrderPromotionsSnapshot,
@@ -2594,6 +2594,82 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(admin_body["items"][0]["paid_amount_total"], "900");
+    }
+
+    #[tokio::test]
+    async fn admin_settlement_recalculates_zero_snapshot_commission_from_invite_rule() {
+        let finance_wallet = "0x1111111111111111111111111111111111111111";
+        let customer_wallet = "0x3333333333333333333333333333333333333333";
+        let (app, state) = build_test_app(vec![admin_config(finance_wallet, "finance")]).await;
+        let finance_token = admin_token(&state, finance_wallet, "finance");
+        let referral_id = state
+            .db
+            .seed_referral_code("SETTLE0")
+            .await
+            .expect("referral seed should succeed");
+        state
+            .db
+            .update_invite_code(
+                referral_id,
+                UpdateInviteCode {
+                    beneficiary_wallet: None,
+                    status: None,
+                    commission_type: Some("percentage".to_string()),
+                    commission_value: Some("1000".to_string()),
+                    valid_from: None,
+                    valid_until: None,
+                    notes: None,
+                },
+            )
+            .await
+            .expect("referral commission update should succeed");
+        let order_row_id = state
+            .db
+            .seed_order(
+                56,
+                "0xsettlezero",
+                1,
+                "settle-zero-order",
+                customer_wallet,
+                "80000000000000000000",
+            )
+            .await
+            .expect("order seed should succeed");
+        state
+            .db
+            .insert_order_promotions_snapshot(NewOrderPromotionsSnapshot {
+                order_row_id,
+                wallet_address: customer_wallet.to_string(),
+                referral_code_id: Some(referral_id),
+                discount_code_id: None,
+                original_total_amount: "80000000000000000000".to_string(),
+                discount_amount: "0".to_string(),
+                paid_amount: "80000000000000000000".to_string(),
+                commission_base_amount: "80000000000000000000".to_string(),
+                commission_amount: "0".to_string(),
+                rule_version: "v1".to_string(),
+                created_at: 1,
+            })
+            .await
+            .expect("snapshot seed should succeed");
+
+        let (status, body) = json_request(
+            &app,
+            Method::GET,
+            "/settlements/referrals",
+            Some(&finance_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["items"][0]["paid_amount_total"],
+            "80000000000000000000"
+        );
+        assert_eq!(
+            body["items"][0]["commission_amount_total"],
+            "8000000000000000000"
+        );
     }
 
     #[tokio::test]

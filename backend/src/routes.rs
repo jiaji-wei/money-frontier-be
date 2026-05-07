@@ -1002,7 +1002,7 @@ mod tests {
         auth::JwtCodec,
         chain::{ChainReader, ChainRuntimeConfig, DecodedPurchase, QuoteResult},
         config::{AppConfig, ChainConfig},
-        db::{Db, PurchaseIntentFilters},
+        db::{Db, PurchaseIntentFilters, UpdateInviteCode},
         mailer::Mailer,
         promotions::DiscountRedemptionStatus,
         AppState,
@@ -1928,6 +1928,22 @@ mod tests {
             .seed_referral_code("alice")
             .await
             .expect("referral code seed should succeed");
+        state
+            .db
+            .update_invite_code(
+                referral_code_id,
+                UpdateInviteCode {
+                    beneficiary_wallet: None,
+                    status: None,
+                    commission_type: Some("percentage".to_string()),
+                    commission_value: Some("1000".to_string()),
+                    valid_from: None,
+                    valid_until: None,
+                    notes: None,
+                },
+            )
+            .await
+            .expect("referral commission update should succeed");
         let discount_code_id = state
             .db
             .seed_fixed_discount_code("save50", "50")
@@ -2082,6 +2098,8 @@ mod tests {
         assert_eq!(snapshot.discount_code_id, Some(discount_code_id));
         assert_eq!(snapshot.paid_amount, "150000000000000000000");
         assert_eq!(snapshot.discount_amount, "50000000000000000000");
+        assert_eq!(snapshot.commission_base_amount, "150000000000000000000");
+        assert_eq!(snapshot.commission_amount, "15000000000000000000");
     }
 
     #[test]
