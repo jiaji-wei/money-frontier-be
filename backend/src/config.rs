@@ -2,6 +2,39 @@ use std::{env, net::SocketAddr};
 
 use serde::Deserialize;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payment_token_decimals_are_configured_by_chain_and_token() {
+        assert_eq!(
+            payment_token_decimals(1, "0xdac17f958d2ee523a2206206994597c13d831ec7"),
+            Some(6)
+        );
+        assert_eq!(
+            payment_token_decimals(1, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            Some(6)
+        );
+        assert_eq!(
+            payment_token_decimals(56, "0x55d398326f99059ff775485246999027b3197955"),
+            Some(18)
+        );
+        assert_eq!(
+            payment_token_decimals(56, "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"),
+            Some(18)
+        );
+        assert_eq!(
+            payment_token_decimals(56, "0xed7b83bf2862ea0f702c76064004effcd0f4b1d5"),
+            Some(18)
+        );
+        assert_eq!(
+            payment_token_decimals(56, "0xfdd9796a8ad4fa1615350e62a1a736382a005677"),
+            Some(18)
+        );
+    }
+}
+
 fn default_confirmations() -> u64 {
     0
 }
@@ -42,6 +75,23 @@ fn default_purchase_intent_ttl_secs() -> i64 {
     900
 }
 
+fn default_admin_jwt_ttl_hours() -> i64 {
+    12
+}
+
+pub fn payment_token_decimals(chain_id: u64, token: &str) -> Option<u8> {
+    let token = token.trim().to_ascii_lowercase();
+    match (chain_id, token.as_str()) {
+        (1, "0xdac17f958d2ee523a2206206994597c13d831ec7") => Some(6),
+        (1, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") => Some(6),
+        (56, "0x55d398326f99059ff775485246999027b3197955") => Some(18),
+        (56, "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d") => Some(18),
+        (56, "0xed7b83bf2862ea0f702c76064004effcd0f4b1d5") => Some(18),
+        (56, "0xfdd9796a8ad4fa1615350e62a1a736382a005677") => Some(18),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChainConfig {
     pub chain_id: u64,
@@ -76,6 +126,7 @@ pub struct AppConfig {
     pub signin_cleanup_retention_secs: i64,
     pub purchase_intent_ttl_secs: i64,
     pub purchase_signer_private_key: Option<String>,
+    pub admin_jwt_ttl_hours: i64,
 }
 
 impl AppConfig {
@@ -145,6 +196,10 @@ impl AppConfig {
             .and_then(|raw| raw.parse::<i64>().ok())
             .unwrap_or_else(default_purchase_intent_ttl_secs);
         let purchase_signer_private_key = env::var("PURCHASE_SIGNER_PRIVATE_KEY").ok();
+        let admin_jwt_ttl_hours = env::var("ADMIN_JWT_TTL_HOURS")
+            .ok()
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or_else(default_admin_jwt_ttl_hours);
 
         Ok(Self {
             bind_addr,
@@ -168,6 +223,7 @@ impl AppConfig {
             signin_cleanup_retention_secs,
             purchase_intent_ttl_secs,
             purchase_signer_private_key,
+            admin_jwt_ttl_hours,
         })
     }
 }

@@ -7,6 +7,7 @@ servers:
 tags:
   - name: auth
   - name: tickets
+  - name: admin
 paths:
   /health:
     get:
@@ -61,6 +62,31 @@ paths:
                 $ref: "#/components/schemas/SigninResponse"
         "401":
           description: Invalid or expired challenge, or invalid signature
+
+  /purchase-quotes:
+    post:
+      tags: [tickets]
+      summary: Preview ticket quote with optional referral and discount
+      description: Calculates original total, discount, and final total without creating a purchase intent, reserving a discount redemption, or signing an authorization.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePurchaseIntentRequest"
+      responses:
+        "200":
+          description: Purchase quote preview
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatePurchaseQuoteResponse"
+        "400":
+          description: Invalid request, unsupported promotion, or quote failure
+        "401":
+          description: Unauthorized
 
   /purchase-intents:
     post:
@@ -211,6 +237,440 @@ paths:
         "401":
           description: Unauthorized
 
+  /admin/auth/challenge:
+    post:
+      tags: [admin]
+      summary: Create one-time admin wallet login challenge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminChallengeRequest"
+      responses:
+        "200":
+          description: Admin challenge created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SigninChallengeResponse"
+
+  /admin/auth/verify:
+    post:
+      tags: [admin]
+      summary: Verify admin challenge and issue admin-scoped JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminVerifyRequest"
+      responses:
+        "200":
+          description: Admin JWT issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminVerifyResponse"
+        "403":
+          description: Wallet is not authorized by on-chain DEFAULT_ADMIN_ROLE or active DB admin wallet
+
+  /admin/me:
+    get:
+      tags: [admin]
+      summary: Return current admin principal
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminMeResponse"
+        "401":
+          description: Missing or invalid admin JWT
+
+  /admin/invite-codes:
+    get:
+      tags: [admin]
+      summary: List invite codes
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Invite code list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PromotionCodeListResponse"
+    post:
+      tags: [admin]
+      summary: Create invite code
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateInviteCodeRequest"
+      responses:
+        "200":
+          description: Invite code created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PromotionCode"
+        "403":
+          description: Operator or admin role required
+
+  /admin/invite-codes/{id}:
+    get:
+      tags: [admin]
+      summary: Get invite code
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Invite code detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PromotionCode"
+    patch:
+      tags: [admin]
+      summary: Update invite code
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Updated invite code
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PromotionCode"
+
+  /admin/invite-codes/{id}/pause:
+    post:
+      tags: [admin]
+      summary: Pause invite code
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Paused invite code
+
+  /admin/invite-codes/{id}/activate:
+    post:
+      tags: [admin]
+      summary: Activate invite code
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Activated invite code
+
+  /admin/discount-codes:
+    get:
+      tags: [admin]
+      summary: List discount codes
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Discount code list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PromotionCodeListResponse"
+    post:
+      tags: [admin]
+      summary: Create discount code
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDiscountCodeRequest"
+      responses:
+        "200":
+          description: Discount code created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PromotionCode"
+
+  /admin/discount-codes/{id}:
+    get:
+      tags: [admin]
+      summary: Get discount code
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Discount code detail
+    patch:
+      tags: [admin]
+      summary: Update discount code
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Updated discount code
+
+  /admin/discount-codes/{id}/pause:
+    post:
+      tags: [admin]
+      summary: Pause discount code
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Paused discount code
+
+  /admin/discount-codes/{id}/activate:
+    post:
+      tags: [admin]
+      summary: Activate discount code
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Activated discount code
+
+  /admin/referral-bindings:
+    get:
+      tags: [admin]
+      summary: List referral bindings joined to invite codes
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Referral binding list
+
+  /admin/purchase-intents:
+    get:
+      tags: [admin]
+      summary: List purchase intents for diagnostics
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: wallet
+          in: query
+          schema: { type: string }
+        - name: tx_hash
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string }
+        - name: code
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Purchase intent list
+
+  /admin/purchase-intents/{id}:
+    get:
+      tags: [admin]
+      summary: Get purchase intent with redemption and linked order
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Purchase intent diagnostic
+
+  /admin/orders:
+    get:
+      tags: [admin]
+      summary: List orders for diagnostics
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: wallet
+          in: query
+          schema: { type: string }
+        - name: tx_hash
+          in: query
+          schema: { type: string }
+        - name: invite_code
+          in: query
+          schema: { type: string }
+        - name: discount_code
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Order list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminOrderListResponse"
+
+  /admin/orders/{id}/attribution:
+    get:
+      tags: [admin]
+      summary: Get order attribution snapshot and linked invite/discount codes
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Order attribution
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderAttributionDiagnostic"
+
+  /admin/settlements/referrals:
+    get:
+      tags: [admin]
+      summary: List referral settlement summary
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Referral settlement summary
+
+  /admin/settlements/referrals.csv:
+    get:
+      tags: [admin]
+      summary: Export referral settlement summary as CSV
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: CSV export
+          content:
+            text/csv:
+              schema:
+                type: string
+
+  /admin/audit-logs:
+    get:
+      tags: [admin]
+      summary: List admin audit logs
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Admin audit log list
+
+  /admin/admin-wallets:
+    get:
+      tags: [admin]
+      summary: List DB-managed admin wallets
+      description: Requires current chain admin role. Non-admin operator wallets are stored in DB and rechecked on every admin API request.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Admin wallet list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminWalletListResponse"
+        "403":
+          description: Chain admin role required
+    post:
+      tags: [admin]
+      summary: Create DB-managed admin wallet
+      description: Creates viewer, operator, or finance wallets. The admin role cannot be written to DB.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAdminWalletRequest"
+      responses:
+        "200":
+          description: Admin wallet created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminWallet"
+        "403":
+          description: Chain admin role required
+
+  /admin/admin-wallets/{id}:
+    get:
+      tags: [admin]
+      summary: Get DB-managed admin wallet
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Admin wallet detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminWallet"
+    patch:
+      tags: [admin]
+      summary: Update DB-managed admin wallet
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateAdminWalletRequest"
+      responses:
+        "200":
+          description: Admin wallet updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminWallet"
+    delete:
+      tags: [admin]
+      summary: Delete DB-managed admin wallet
+      description: A deleted wallet's previously issued admin JWT is rejected on the next admin API request.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/NumericId"
+      responses:
+        "200":
+          description: Admin wallet deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminWallet"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -218,7 +678,315 @@ components:
       scheme: bearer
       bearerFormat: JWT
 
+  parameters:
+    NumericId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+
   schemas:
+    AdminChallengeRequest:
+      type: object
+      required: [address]
+      properties:
+        address:
+          type: string
+
+    AdminVerifyRequest:
+      type: object
+      required: [address, challenge_id, signature]
+      properties:
+        address:
+          type: string
+        challenge_id:
+          type: string
+        signature:
+          type: string
+
+    AdminVerifyResponse:
+      type: object
+      required: [wallet, role, token, expires_at]
+      properties:
+        wallet:
+          type: string
+        role:
+          type: string
+          enum: [viewer, operator, finance, admin]
+        token:
+          type: string
+        expires_at:
+          type: integer
+          format: int64
+
+    AdminMeResponse:
+      type: object
+      required: [wallet, role, scope]
+      properties:
+        wallet:
+          type: string
+        role:
+          type: string
+          enum: [viewer, operator, finance, admin]
+        scope:
+          type: string
+          const: admin
+
+    AdminWallet:
+      type: object
+      required: [id, wallet_address, role, status, created_by, updated_by, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        wallet_address:
+          type: string
+        role:
+          type: string
+          enum: [viewer, operator, finance]
+        status:
+          type: string
+          enum: [active, disabled]
+        notes:
+          type: string
+          nullable: true
+        created_by:
+          type: string
+        updated_by:
+          type: string
+        created_at:
+          type: integer
+          format: int64
+        updated_at:
+          type: integer
+          format: int64
+
+    AdminWalletListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminWallet"
+
+    CreateAdminWalletRequest:
+      type: object
+      required: [wallet_address, role]
+      properties:
+        wallet_address:
+          type: string
+        role:
+          type: string
+          enum: [viewer, operator, finance]
+        status:
+          type: string
+          enum: [active, disabled]
+          default: active
+        notes:
+          type: string
+          nullable: true
+
+    UpdateAdminWalletRequest:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [viewer, operator, finance]
+        status:
+          type: string
+          enum: [active, disabled]
+        notes:
+          type: string
+          nullable: true
+
+    PromotionCode:
+      type: object
+      required: [id, code_normalized, kind, status, first_purchase_only, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        code_normalized:
+          type: string
+        kind:
+          type: string
+          enum: [referral, discount]
+        status:
+          type: string
+          enum: [active, paused, expired, exhausted]
+        beneficiary_wallet:
+          type: string
+          nullable: true
+        discount_type:
+          type: string
+          nullable: true
+        discount_value:
+          type: string
+          nullable: true
+        commission_type:
+          type: string
+          nullable: true
+        commission_value:
+          type: string
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+        first_purchase_only:
+          type: boolean
+        created_at:
+          type: integer
+          format: int64
+        updated_at:
+          type: integer
+          format: int64
+
+    PromotionCodeListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/PromotionCode"
+
+    CreateInviteCodeRequest:
+      type: object
+      required: [code, status]
+      properties:
+        code:
+          type: string
+          minLength: 4
+          maxLength: 32
+          pattern: "^[A-Z0-9]{4,32}$"
+          description: Custom invite codes may use uppercase letters and digits. Frontend-generated random invite codes should still avoid ambiguous characters.
+        beneficiary_wallet:
+          type: string
+          nullable: true
+          description: Optional at creation; can be filled later before settlement payout.
+        status:
+          type: string
+        commission_type:
+          type: string
+          nullable: true
+        commission_value:
+          type: string
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+
+    CreateDiscountCodeRequest:
+      type: object
+      required: [code, status, discount_type, discount_value]
+      properties:
+        code:
+          type: string
+          minLength: 8
+          maxLength: 32
+          pattern: "^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{8,32}$"
+          description: Uppercase letters and digits with ambiguous characters 0, 1, I, L, and O excluded.
+        status:
+          type: string
+        discount_type:
+          type: string
+          enum: [fixed, percentage]
+        discount_value:
+          type: string
+          description: For percentage, basis points. For fixed, human-readable token amount; backend converts with the selected payment token decimals at purchase-intent time.
+        max_discount_amount:
+          type: string
+          nullable: true
+          description: Human-readable token amount cap; backend converts with the selected payment token decimals.
+
+    AdminOrderLineItem:
+      type: object
+      required: [ticket_level, quantity, unit_price]
+      properties:
+        ticket_level:
+          type: integer
+          format: int64
+        quantity:
+          type: integer
+          format: int64
+        unit_price:
+          type: string
+
+    AdminOrder:
+      type: object
+      required: [id, chain_id, tx_hash, log_index, block_number, block_hash, order_id, buyer_address, payment_token, total_amount, created_at, line_items]
+      properties:
+        id:
+          type: integer
+          format: int64
+        chain_id:
+          type: integer
+          format: int64
+        tx_hash:
+          type: string
+        log_index:
+          type: integer
+          format: int64
+        block_number:
+          type: integer
+          format: int64
+        block_hash:
+          type: string
+        order_id:
+          type: string
+        buyer_address:
+          type: string
+        payment_token:
+          type: string
+        total_amount:
+          type: string
+        original_total_amount:
+          type: string
+          nullable: true
+        discount_amount:
+          type: string
+          nullable: true
+        paid_amount:
+          type: string
+          nullable: true
+        created_at:
+          type: integer
+          format: int64
+        line_items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminOrderLineItem"
+
+    AdminOrderListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminOrder"
+
+    OrderAttributionDiagnostic:
+      type: object
+      required: [order]
+      properties:
+        order:
+          $ref: "#/components/schemas/AdminOrder"
+        snapshot:
+          type: object
+          nullable: true
+        invite_code:
+          allOf:
+            - $ref: "#/components/schemas/PromotionCode"
+          nullable: true
+        discount_code:
+          allOf:
+            - $ref: "#/components/schemas/PromotionCode"
+          nullable: true
+
     SigninChallengeRequest:
       type: object
       required: [address]
@@ -342,6 +1110,31 @@ components:
           type: string
           nullable: true
           enum: [bound, already_bound, invalid]
+
+    CreatePurchaseQuoteResponse:
+      type: object
+      required:
+        - original_total_amount
+        - discount_amount
+        - final_total_amount
+        - discount_status
+        - discount_message
+      properties:
+        original_total_amount:
+          type: string
+        discount_amount:
+          type: string
+        final_total_amount:
+          type: string
+        discount_status:
+          type: string
+          enum: [none, applied, no_discount]
+        discount_message:
+          type: string
+        referral_binding_status:
+          type: string
+          nullable: true
+          enum: [would_bind, already_bound, invalid]
 
     PurchaseIntentResponse:
       type: object

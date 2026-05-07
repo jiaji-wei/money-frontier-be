@@ -30,6 +30,7 @@
 - 前端：
   - 负责钱包连接、签名、交易发起、交易状态展示
   - 调用后端 API 进行票务管理
+  - 运营后台使用独立 `/admin` 区域、独立 admin JWT 和独立浏览器 session key
 
 ### 1.2 关键业务约束（前端必须理解）
 
@@ -121,7 +122,7 @@ Content-Type: application/json
   "address": "0x...",
   "challenge_id": "uuid",
   "signature": "0x...",
-  "referral_code": "ALICE-01"
+  "referral_code": "PARTNERX"
 }
 ```
 
@@ -249,6 +250,140 @@ OpenAPI 源文件：
 }
 ```
 
+### 4.x Operations Admin APIs
+
+运营后台不要复用买家 JWT，也不要复用 `lili.auth.session`。前端实现应使用独立 session：
+
+```ts
+{
+  token: string
+  wallet: string
+  role: 'viewer' | 'operator' | 'finance' | 'admin'
+  expiresAt: number
+}
+```
+
+推荐浏览器 key：
+
+```text
+lili.adminSession
+```
+
+Admin 登录流程：
+
+1. `POST /admin/auth/challenge`，请求字段为 `address`
+2. 钱包签名后端返回的 `challenge_message`，该消息以 `Admin Sign-In` 开头
+3. `POST /admin/auth/verify`
+4. 保存返回的 admin JWT，并对后续 `/admin/*` 请求加：
+
+```http
+Authorization: Bearer <admin-token>
+```
+
+Admin JWT 关键规则：
+
+- claim `scope` 必须为 `admin`
+- buyer JWT 调 `/admin/me` 会返回 `401`
+- `admin` 最高权限来自链上 `TicketSale.hasRole(DEFAULT_ADMIN_ROLE, wallet)`
+- `viewer` / `operator` / `finance` 运营钱包写入 DB `admin_wallets`，由链上 `admin` 在后台维护
+- 每次 admin API 请求都会重新检查链上权限或 DB 钱包状态；钱包被禁用或删除后，旧 JWT 下一次请求会返回 `403`
+
+运营后台业务模块必须分开暴露：
+
+- 邀请码：`/admin/invite-codes`
+- 折扣码：`/admin/discount-codes`
+
+二者内部都落到 `promotion_codes`，但前端不应做通用 promotion 管理页。
+
+#### Admin auth
+
+```http
+POST /admin/auth/challenge
+Content-Type: application/json
+
+{ "address": "0x..." }
+```
+
+```http
+POST /admin/auth/verify
+Content-Type: application/json
+
+{
+  "address": "0x...",
+  "challenge_id": "uuid",
+  "signature": "0x..."
+}
+```
+
+#### Invite code APIs
+
+- `GET /admin/invite-codes`
+- `POST /admin/invite-codes`
+- `GET /admin/invite-codes/:id`
+- `PATCH /admin/invite-codes/:id`
+- `POST /admin/invite-codes/:id/pause`
+- `POST /admin/invite-codes/:id/activate`
+
+Create request:
+
+```json
+{
+  "code": "PARTNERX",
+  "beneficiary_wallet": "0x...",
+  "status": "active",
+  "commission_type": "percentage",
+  "commission_value": "1000",
+  "notes": "partner invite"
+}
+```
+
+`beneficiary_wallet` 可在创建时省略，后续合作方提供钱包后再通过 `PATCH /admin/invite-codes/:id` 补充。未填写时不影响邀请码绑定和订单归因，但 referral settlement 会显示缺少收款钱包。
+
+#### Discount code APIs
+
+- `GET /admin/discount-codes`
+- `POST /admin/discount-codes`
+- `GET /admin/discount-codes/:id`
+- `PATCH /admin/discount-codes/:id`
+- `POST /admin/discount-codes/:id/pause`
+- `POST /admin/discount-codes/:id/activate`
+
+Create request:
+
+```json
+{
+  "code": "SAVE2345",
+  "status": "active",
+  "discount_type": "percentage",
+  "discount_value": "1000"
+}
+```
+
+邀请码自定义输入允许 4 到 32 位 `A-Z0-9`；前端随机生成的邀请码仍应使用 8 位安全码字符：`23456789ABCDEFGHJKMNPQRSTUVWXYZ`，避免 `0`、`1`、`I`、`L`、`O` 等视觉歧义字符。
+
+折扣码必须使用 8 到 32 位安全码字符：`23456789ABCDEFGHJKMNPQRSTUVWXYZ`。不允许 `0`、`1`、`I`、`L`、`O` 等视觉歧义字符。
+
+`discount_type = percentage` 时 `discount_value` 是 basis points，范围 `1..=10000`。
+`discount_type = fixed` 时 `discount_value` 是运营输入的人类可读 token amount，例如 `20` 表示 20 USDT/USDC；后端在创建 purchase intent 时根据代码内配置的 `chain_id + payment_token` decimals 转换为合约使用的 base unit。
+
+#### Diagnostics and finance
+
+- `GET /admin/referral-bindings`
+- `GET /admin/purchase-intents`
+- `GET /admin/purchase-intents/:id`
+- `GET /admin/orders`
+- `GET /admin/orders/:id/attribution`
+- `GET /admin/settlements/referrals`
+- `GET /admin/settlements/referrals.csv`
+- `GET /admin/audit-logs`
+
+权限约束：
+
+- `viewer` 可读邀请码、折扣码、绑定、购买和订单诊断
+- `operator` 可写邀请码和折扣码
+- `finance` 可查看和导出 referral settlement
+- `admin` 可查看 audit logs，并拥有全部权限
+
 #### `POST /signin`
 
 用途：
@@ -262,7 +397,7 @@ OpenAPI 源文件：
   "address": "0x1111111111111111111111111111111111111111",
   "challenge_id": "uuid",
   "signature": "0x...",
-  "referral_code": "ALICE-01"
+  "referral_code": "PARTNERX"
 }
 ```
 
@@ -275,7 +410,7 @@ OpenAPI 源文件：
   "expires_at": 1739999999,
   "referral_binding": {
     "status": "bound",
-    "referral_code": "ALICE-01"
+    "referral_code": "PARTNERX"
   }
 }
 ```
@@ -307,8 +442,8 @@ OpenAPI 源文件：
   "payment_token": "0x0000000000000000000000000000000000001002",
   "level_ids": [1],
   "quantities": [2],
-  "discount_code": "SAVE50",
-  "referral_code": "ALICE-01"
+  "discount_code": "SAVE2345",
+  "referral_code": "PARTNERX"
 }
 ```
 

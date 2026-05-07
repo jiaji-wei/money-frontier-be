@@ -8,10 +8,11 @@ REMOTE_USER="${REMOTE_USER:-ubuntu}"
 REMOTE_PORT="${REMOTE_PORT:-22}"
 REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/app/tickets}"
 REMOTE_DATA_DIR="${REMOTE_DATA_DIR:-${REMOTE_DIR}/data}"
-REMOTE_BACKEND_BIN_NAME="${REMOTE_BACKEND_BIN_NAME:-ticket-backend-1}"
+REMOTE_BACKEND_BIN_NAME="${REMOTE_BACKEND_BIN_NAME:-auto}"
 
 BACKEND_BIN="${BACKEND_BIN:-${ROOT_DIR}/dist/prebuilt/linux-amd64/ticket-backend}"
 BACKEND_ENV_FILE="${BACKEND_ENV_FILE:-${ROOT_DIR}/backend/.env}"
+BUILD_BACKEND="${BUILD_BACKEND:-0}"
 UPLOAD_ENV="${UPLOAD_ENV:-0}"
 
 SYSTEMD_UNIT_FILE="${SYSTEMD_UNIT_FILE:-}"
@@ -23,6 +24,7 @@ REMOTE_DB_FILE="${REMOTE_DB_FILE:-${REMOTE_DATA_DIR}/ticket.db}"
 
 SSH_IDENTITY_FILE="${SSH_IDENTITY_FILE:-}"
 DRY_RUN="${DRY_RUN:-0}"
+REMOTE_BACKEND_BIN_LIST="${REMOTE_BACKEND_BIN_LIST:-}"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -41,9 +43,10 @@ Optional:
   REMOTE_PORT                SSH port (default: 22)
   REMOTE_DIR                 Remote app directory (default: /home/ubuntu/app/tickets)
   REMOTE_DATA_DIR            Remote data directory (default: $REMOTE_DIR/data)
-  REMOTE_BACKEND_BIN_NAME    Remote backend binary filename (default: ticket-backend-1)
+  REMOTE_BACKEND_BIN_NAME    Remote backend binary filename, or auto for next ticket-backend-N (default: auto)
   BACKEND_BIN                Local backend binary path (default: ./dist/prebuilt/linux-amd64/ticket-backend)
   BACKEND_ENV_FILE           Local env file path
+  BUILD_BACKEND              1 to build linux/amd64 backend binary with Docker before upload (default: 0)
   UPLOAD_ENV                 1 to upload env file, else 0 (default: 0)
   UPLOAD_DB                  1 to upload sqlite db file, else 0 (default: 0)
   DB_FILE                    Local sqlite db file path (auto-resolve from BACKEND_ENV_FILE if empty)
@@ -55,6 +58,9 @@ Optional:
 
 Example:
   ./scripts/deploy-backend-scp.sh
+
+Build and deploy:
+  BUILD_BACKEND=1 ./scripts/deploy-backend-scp.sh
 EOF
 }
 
@@ -98,6 +104,78 @@ resolve_db_file() {
   DB_FILE="${env_dir}/${sqlite_path}"
 }
 
+next_backend_bin_name() {
+  local existing_names="$1"
+  local max_suffix=0
+  local name
+  local suffix
+
+  while IFS= read -r name; do
+    if [[ "${name}" =~ ^ticket-backend-([0-9]+)$ ]]; then
+      suffix="${BASH_REMATCH[1]}"
+      if ((suffix > max_suffix)); then
+        max_suffix="${suffix}"
+      fi
+    fi
+  done <<<"${existing_names}"
+
+  echo "ticket-backend-$((max_suffix + 1))"
+}
+
+build_backend_binary() {
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "[dry-run] build linux/amd64 backend binary into ${BACKEND_BIN}"
+    return
+  fi
+
+  require_cmd docker
+
+  local image_name="ticket-backend-builder:deploy"
+  local container_id=""
+  local out_dir
+
+  out_dir="$(dirname "${BACKEND_BIN}")"
+  mkdir -p "${out_dir}"
+
+  docker build --platform linux/amd64 --target builder \
+    -f "${ROOT_DIR}/docker/backend/Dockerfile" \
+    -t "${image_name}" \
+    "${ROOT_DIR}"
+
+  container_id="$(docker create --platform linux/amd64 "${image_name}")"
+  docker cp "${container_id}:/build/backend/target/release/ticket-backend" "${BACKEND_BIN}"
+  docker rm "${container_id}" >/dev/null
+  chmod +x "${BACKEND_BIN}"
+}
+
+resolve_remote_backend_bin_name() {
+  local ssh_target="$1"
+  shift
+  local ssh_opts=("$@")
+  local existing_names
+
+  if [[ "${REMOTE_BACKEND_BIN_NAME}" != "auto" ]]; then
+    return
+  fi
+
+  if [[ -n "${REMOTE_BACKEND_BIN_LIST}" ]]; then
+    REMOTE_BACKEND_BIN_NAME="$(next_backend_bin_name "${REMOTE_BACKEND_BIN_LIST}")"
+    return
+  fi
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    REMOTE_BACKEND_BIN_NAME="ticket-backend-1"
+    return
+  fi
+
+  existing_names="$(
+    ssh "${ssh_opts[@]}" "${ssh_target}" \
+      "for f in '${REMOTE_DIR}'/ticket-backend-[0-9]*; do [ -e \"\$f\" ] && basename \"\$f\"; done" \
+      2>/dev/null || true
+  )"
+  REMOTE_BACKEND_BIN_NAME="$(next_backend_bin_name "${existing_names}")"
+}
+
 run_cmd() {
   if [[ "${DRY_RUN}" == "1" ]]; then
     echo "[dry-run] $*"
@@ -116,13 +194,13 @@ main() {
     exit 1
   fi
 
-  if [[ ! -f "${BACKEND_BIN}" ]]; then
-    echo "backend binary not found: ${BACKEND_BIN}" >&2
-    exit 1
+  if [[ "${BUILD_BACKEND}" == "1" ]]; then
+    build_backend_binary
   fi
 
-  if [[ -z "${REMOTE_BACKEND_BIN_NAME}" || "${REMOTE_BACKEND_BIN_NAME}" == */* ]]; then
-    echo "REMOTE_BACKEND_BIN_NAME must be a non-empty filename without slashes" >&2
+  if [[ ! -f "${BACKEND_BIN}" && ! ("${DRY_RUN}" == "1" && "${BUILD_BACKEND}" == "1") ]]; then
+    echo "backend binary not found: ${BACKEND_BIN}" >&2
+    echo "run with BUILD_BACKEND=1 to build it before upload" >&2
     exit 1
   fi
 
@@ -149,7 +227,6 @@ main() {
   fi
 
   local ssh_target="${REMOTE_USER}@${REMOTE_HOST}"
-  local remote_backend_bin="${REMOTE_DIR}/${REMOTE_BACKEND_BIN_NAME}"
   local ssh_opts=(-p "${REMOTE_PORT}" -o StrictHostKeyChecking=accept-new)
   local scp_opts=(-P "${REMOTE_PORT}" -o StrictHostKeyChecking=accept-new)
 
@@ -157,6 +234,15 @@ main() {
     ssh_opts+=(-i "${SSH_IDENTITY_FILE}")
     scp_opts+=(-i "${SSH_IDENTITY_FILE}")
   fi
+
+  resolve_remote_backend_bin_name "${ssh_target}" "${ssh_opts[@]}"
+
+  if [[ -z "${REMOTE_BACKEND_BIN_NAME}" || "${REMOTE_BACKEND_BIN_NAME}" == */* ]]; then
+    echo "REMOTE_BACKEND_BIN_NAME must resolve to a non-empty filename without slashes" >&2
+    exit 1
+  fi
+
+  local remote_backend_bin="${REMOTE_DIR}/${REMOTE_BACKEND_BIN_NAME}"
 
   echo "target: ${ssh_target}"
   echo "remote dir: ${REMOTE_DIR}"

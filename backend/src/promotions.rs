@@ -6,10 +6,11 @@ use ethers_core::{
     utils::keccak256,
 };
 use ethers_signers::{LocalWallet, Signer};
+use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct PromotionCodeRow {
     pub id: i64,
     pub code_normalized: String,
@@ -29,11 +30,12 @@ pub struct PromotionCodeRow {
     pub max_discount_amount: Option<String>,
     pub commission_type: Option<String>,
     pub commission_value: Option<String>,
+    pub notes: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct WalletReferralBindingRow {
     pub wallet_address: String,
     pub referral_code_id: i64,
@@ -93,7 +95,7 @@ impl NewPurchaseIntent {
     }
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct PurchaseIntentRow {
     pub id: String,
     pub wallet_address: String,
@@ -144,7 +146,7 @@ pub struct NewDiscountRedemption {
     pub released_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct DiscountRedemptionRow {
     pub purchase_intent_id: String,
     pub discount_code_id: i64,
@@ -172,7 +174,7 @@ pub struct NewOrderPromotionsSnapshot {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct OrderPromotionsSnapshotRow {
     pub order_row_id: i64,
     pub wallet_address: String,
@@ -194,6 +196,50 @@ pub fn normalize_promotion_code(value: &str) -> Option<String> {
     } else {
         Some(normalized)
     }
+}
+
+pub const PROMOTION_CODE_MIN_LEN: usize = 8;
+pub const INVITE_CODE_MIN_LEN: usize = 4;
+pub const PROMOTION_CODE_MAX_LEN: usize = 32;
+pub const SAFE_PROMOTION_CODE_ALPHABET: &str = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+pub fn normalize_new_invite_code(value: &str) -> Result<String, String> {
+    let normalized = normalize_new_code_length(value, INVITE_CODE_MIN_LEN)?;
+
+    if !normalized.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return Err("invite code must use A-Z and 0-9".to_string());
+    }
+
+    Ok(normalized)
+}
+
+pub fn normalize_new_promotion_code(value: &str) -> Result<String, String> {
+    let normalized = normalize_new_code_length(value, PROMOTION_CODE_MIN_LEN)?;
+
+    if !normalized
+        .chars()
+        .all(|ch| SAFE_PROMOTION_CODE_ALPHABET.contains(ch))
+    {
+        return Err(
+            "promotion code must use A-Z and 0-9 without ambiguous characters 0, 1, I, L, O"
+                .to_string(),
+        );
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_new_code_length(value: &str, min_len: usize) -> Result<String, String> {
+    let normalized = value.trim().to_uppercase();
+    let len = normalized.chars().count();
+
+    if !(min_len..=PROMOTION_CODE_MAX_LEN).contains(&len) {
+        return Err(format!(
+            "promotion code must be {min_len}-{PROMOTION_CODE_MAX_LEN} characters"
+        ));
+    }
+
+    Ok(normalized)
 }
 
 pub fn normalize_wallet_key(value: &str) -> String {
