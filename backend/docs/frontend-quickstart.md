@@ -82,7 +82,7 @@
   "address": "0x...",
   "challenge_id": "uuid",
   "signature": "0x...",
-  "referral_code": "ALICE-01"
+  "referral_code": "PARTNERX"
 }
 ```
 
@@ -123,8 +123,8 @@ Authorization: Bearer <jwt>
   "payment_token": "0x...",
   "level_ids": [1],
   "quantities": [2],
-  "discount_code": "SAVE50",
-  "referral_code": "ALICE-01"
+  "discount_code": "SAVE2345",
+  "referral_code": "PARTNERX"
 }
 ```
 

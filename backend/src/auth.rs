@@ -15,6 +15,15 @@ pub struct Claims {
     pub exp: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminClaims {
+    pub sub: String,
+    pub scope: String,
+    pub role: String,
+    pub iat: usize,
+    pub exp: usize,
+}
+
 #[derive(Clone)]
 pub struct JwtCodec {
     encoding_key: EncodingKey,
@@ -56,6 +65,51 @@ impl JwtCodec {
             .map_err(|_| ApiError::unauthorized("invalid jwt"))?;
         Ok(data.claims)
     }
+
+    pub fn issue_admin(
+        &self,
+        wallet: &str,
+        role: &str,
+        ttl_hours: i64,
+    ) -> Result<(String, i64), ApiError> {
+        if !is_valid_admin_role(role) {
+            return Err(ApiError::unauthorized("invalid admin role"));
+        }
+
+        let iat = Utc::now();
+        let exp = iat + Duration::hours(ttl_hours);
+        let claims = AdminClaims {
+            sub: wallet.to_owned(),
+            scope: "admin".to_string(),
+            role: role.to_string(),
+            iat: iat.timestamp() as usize,
+            exp: exp.timestamp() as usize,
+        };
+
+        let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)
+            .map_err(|err| ApiError::internal(format!("admin jwt encode failed: {err}")))?;
+
+        Ok((token, exp.timestamp()))
+    }
+
+    pub fn verify_admin(&self, token: &str) -> Result<AdminClaims, ApiError> {
+        let validation = Validation::new(Algorithm::HS256);
+        let data = decode::<AdminClaims>(token, &self.decoding_key, &validation)
+            .map_err(|_| ApiError::unauthorized("invalid admin jwt"))?;
+
+        if data.claims.scope != "admin" {
+            return Err(ApiError::unauthorized("invalid admin scope"));
+        }
+        if !is_valid_admin_role(&data.claims.role) {
+            return Err(ApiError::unauthorized("invalid admin role"));
+        }
+
+        Ok(data.claims)
+    }
+}
+
+pub fn is_valid_admin_role(role: &str) -> bool {
+    matches!(role, "viewer" | "operator" | "finance" | "admin")
 }
 
 pub fn extract_wallet(headers: &HeaderMap, jwt: &JwtCodec) -> Result<String, ApiError> {
@@ -97,4 +151,60 @@ pub fn verify_wallet_signature(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_jwt_round_trips_admin_claims() {
+        let jwt = JwtCodec::new("test-secret", 1).expect("jwt codec should initialize");
+
+        let (token, expires_at) = jwt
+            .issue_admin("0x1111111111111111111111111111111111111111", "operator", 12)
+            .expect("admin jwt should issue");
+        let claims = jwt.verify_admin(&token).expect("admin jwt should verify");
+
+        assert_eq!(claims.sub, "0x1111111111111111111111111111111111111111");
+        assert_eq!(claims.scope, "admin");
+        assert_eq!(claims.role, "operator");
+        assert!(expires_at > claims.iat as i64);
+    }
+
+    #[test]
+    fn admin_jwt_rejects_buyer_tokens() {
+        let jwt = JwtCodec::new("test-secret", 1).expect("jwt codec should initialize");
+        let (buyer_token, _) = jwt
+            .issue("0x1111111111111111111111111111111111111111")
+            .expect("buyer jwt should issue");
+
+        let err = jwt
+            .verify_admin(&buyer_token)
+            .expect_err("buyer jwt must not verify as admin");
+
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn admin_jwt_rejects_invalid_roles() {
+        let jwt = JwtCodec::new("test-secret", 1).expect("jwt codec should initialize");
+        let iat = Utc::now();
+        let exp = iat + Duration::hours(12);
+        let claims = serde_json::json!({
+            "sub": "0x1111111111111111111111111111111111111111",
+            "scope": "admin",
+            "role": "owner",
+            "iat": iat.timestamp() as usize,
+            "exp": exp.timestamp() as usize
+        });
+        let token = encode(&Header::new(Algorithm::HS256), &claims, &jwt.encoding_key)
+            .expect("custom jwt should encode");
+
+        let err = jwt
+            .verify_admin(&token)
+            .expect_err("invalid admin role must not verify");
+
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
 }

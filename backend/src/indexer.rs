@@ -246,6 +246,10 @@ mod tests {
         ) -> anyhow::Result<QuoteResult> {
             anyhow::bail!("quote purchase is not used by indexer tests")
         }
+
+        async fn has_default_admin_role(&self, _wallet: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
     }
 
     async fn build_state(mock_chain: Arc<MockChain>) -> Arc<AppState> {
@@ -274,6 +278,7 @@ mod tests {
             signin_cleanup_retention_secs: 86400,
             purchase_intent_ttl_secs: 900,
             purchase_signer_private_key: None,
+            admin_jwt_ttl_hours: 12,
         };
 
         let jwt =

@@ -61,6 +61,7 @@ pub trait ChainReader: Send + Sync {
         level_ids: &[u8],
         quantities: &[u64],
     ) -> anyhow::Result<QuoteResult>;
+    async fn has_default_admin_role(&self, wallet: &str) -> anyhow::Result<bool>;
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +290,66 @@ impl ChainService {
             unit_prices,
         })
     }
+
+    async fn has_default_admin_role_via_rpc(&self, wallet: &str) -> anyhow::Result<bool> {
+        let wallet = Address::from_str(wallet).context("invalid admin wallet address")?;
+        let mut last_error = None;
+
+        for client in self.clients.values() {
+            match client.has_default_admin_role(wallet).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(err) => last_error = Some(err),
+            }
+        }
+
+        if let Some(err) = last_error {
+            return Err(err).context("check DEFAULT_ADMIN_ROLE failed");
+        }
+
+        Ok(false)
+    }
+}
+
+impl ChainClient {
+    async fn has_default_admin_role(&self, wallet: Address) -> anyhow::Result<bool> {
+        #[allow(deprecated)]
+        let function = Function {
+            name: "hasRole".to_string(),
+            inputs: vec![
+                Param {
+                    name: "role".to_string(),
+                    kind: ParamType::FixedBytes(32),
+                    internal_type: None,
+                },
+                Param {
+                    name: "account".to_string(),
+                    kind: ParamType::Address,
+                    internal_type: None,
+                },
+            ],
+            outputs: vec![Param {
+                name: "enabled".to_string(),
+                kind: ParamType::Bool,
+                internal_type: None,
+            }],
+            constant: None,
+            state_mutability: StateMutability::View,
+        };
+
+        let calldata =
+            function.encode_input(&[Token::FixedBytes(vec![0; 32]), Token::Address(wallet)])?;
+        let tx = TransactionRequest::new()
+            .to(self.sale_contract)
+            .data(Bytes::from(calldata));
+        let raw = self.provider.call(&tx.into(), None).await?;
+        let decoded = function.decode_output(raw.as_ref())?;
+
+        match &decoded[0] {
+            Token::Bool(value) => Ok(*value),
+            _ => anyhow::bail!("hasRole returned unexpected type"),
+        }
+    }
 }
 
 #[async_trait]
@@ -395,6 +456,10 @@ impl ChainReader for ChainService {
     ) -> anyhow::Result<QuoteResult> {
         self.quote_purchase_via_rpc(chain_id, level_ids, quantities)
             .await
+    }
+
+    async fn has_default_admin_role(&self, wallet: &str) -> anyhow::Result<bool> {
+        self.has_default_admin_role_via_rpc(wallet).await
     }
 }
 
