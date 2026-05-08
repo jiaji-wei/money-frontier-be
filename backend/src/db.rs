@@ -2276,7 +2276,11 @@ ExpiresAt: {expires_at}"
 
                 for _ in 0..quantity {
                     let ticket_id = Uuid::new_v4().to_string();
-                    let qr_payload = format!("lili:qr:{}:1:{}", ticket_id, Uuid::new_v4().simple());
+                    let qr_payload = format!(
+                        "money-frontier:qr:{}:1:{}",
+                        ticket_id,
+                        Uuid::new_v4().simple()
+                    );
 
                     sqlx::query(
                         r#"
@@ -2476,7 +2480,11 @@ ExpiresAt: {expires_at}"
                 .await?;
 
         let new_ticket_id = Uuid::new_v4().to_string();
-        let new_qr_payload = format!("lili:qr:{}:1:{}", new_ticket_id, Uuid::new_v4().simple());
+        let new_qr_payload = format!(
+            "money-frontier:qr:{}:1:{}",
+            new_ticket_id,
+            Uuid::new_v4().simple()
+        );
 
         sqlx::query(
             r#"
@@ -3039,6 +3047,7 @@ fn parse_human_token_amount(value: &str, decimals: Option<u8>) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::Db;
+    use crate::chain::DecodedPurchase;
 
     #[tokio::test]
     async fn purge_signin_challenges_removes_only_old_rows() {
@@ -3110,6 +3119,53 @@ mod tests {
         assert!(challenge.challenge_message.contains("Nonce: "));
         assert!(challenge.challenge_message.contains("IssuedAt: "));
         assert!(challenge.challenge_message.contains("ExpiresAt: "));
+    }
+
+    #[tokio::test]
+    async fn index_and_transfer_ticket_use_money_frontier_qr_payload_prefix() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("db should initialize");
+        let buyer = "0x1111111111111111111111111111111111111111";
+
+        db.index_purchase(
+            56,
+            &DecodedPurchase {
+                tx_hash: "0xaaa".to_string(),
+                log_index: 0,
+                block_number: 100,
+                block_hash: Some("0xblock".to_string()),
+                order_id: "1".to_string(),
+                buyer: buyer.to_string(),
+                payment_token: "0x2222222222222222222222222222222222222222".to_string(),
+                total_amount: "1000000000000000000".to_string(),
+                level_ids: vec![1],
+                quantities: vec![1],
+                unit_prices: vec!["1000000000000000000".to_string()],
+                intent_id: None,
+            },
+        )
+        .await
+        .expect("purchase should index");
+
+        let tickets = db
+            .list_active_tickets_by_wallet(buyer)
+            .await
+            .expect("tickets should load");
+        assert_eq!(tickets.len(), 1);
+        assert!(tickets[0].qr_payload.starts_with("money-frontier:qr:"));
+
+        let transferred = db
+            .transfer_ticket(
+                &tickets[0].id,
+                buyer,
+                Some("0x3333333333333333333333333333333333333333"),
+                None,
+            )
+            .await
+            .expect("transfer should succeed")
+            .expect("ticket should transfer");
+        assert!(transferred.qr_payload.starts_with("money-frontier:qr:"));
     }
 
     #[tokio::test]

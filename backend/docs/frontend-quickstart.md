@@ -1,4 +1,4 @@
-# Lili Ticket Frontend Quickstart
+# Money Frontier Ticket Frontend Quickstart
 
 本文档是给前端同学的精简接入版，目标是快速完成可用联调。
 
@@ -162,6 +162,8 @@ Authorization: Bearer <jwt>
 - `quote(uint8[] level_ids, uint256[] quantities)`
 - `currentPrice(uint8 level_id)`
 - `getPriceSchedule(uint8 level_id)`（如果要展示时间段价格）
+
+前端展示当前票价时优先调用后端 `POST /purchase-prices`，后端会通过合约 `quote(level_ids, [1...])` 返回链上实时单价。
 
 写入：
 

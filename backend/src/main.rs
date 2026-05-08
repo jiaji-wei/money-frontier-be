@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(routes::health))
         .route("/signin/challenge", post(routes::signin_challenge))
         .route("/signin", post(routes::signin_verify))
+        .route("/purchase-prices", post(routes::list_ticket_prices))
         .route("/purchase-quotes", post(routes::create_purchase_quote))
         .route("/purchase-intents", post(routes::create_purchase_intent))
         .route("/purchase-intents/:id", get(routes::get_purchase_intent))

@@ -117,6 +117,24 @@ pub struct CreatePurchaseQuoteResponse {
     pub referral_binding_status: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TicketPricesRequest {
+    pub chain_id: u64,
+    pub level_ids: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TicketPriceView {
+    pub level_id: u8,
+    pub unit_price: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TicketPricesResponse {
+    pub chain_id: u64,
+    pub prices: Vec<TicketPriceView>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PurchaseIntentResponse {
     pub id: String,
@@ -390,6 +408,34 @@ pub async fn create_purchase_quote(
     }))
 }
 
+pub async fn list_ticket_prices(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TicketPricesRequest>,
+) -> Result<Json<TicketPricesResponse>, ApiError> {
+    find_chain_config(&state.config.chains, req.chain_id)?;
+    validate_price_request(&req)?;
+
+    let quantities = vec![1_u64; req.level_ids.len()];
+    let quote = state
+        .chain
+        .quote_purchase(req.chain_id, &req.level_ids, &quantities)
+        .await
+        .map_err(|err| ApiError::bad_request(format!("failed to quote ticket prices: {err}")))?;
+
+    Ok(Json(TicketPricesResponse {
+        chain_id: req.chain_id,
+        prices: req
+            .level_ids
+            .into_iter()
+            .zip(quote.unit_prices)
+            .map(|(level_id, unit_price)| TicketPriceView {
+                level_id,
+                unit_price,
+            })
+            .collect(),
+    }))
+}
+
 pub async fn get_purchase_intent(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -623,6 +669,13 @@ fn validate_purchase_intent_request(req: &CreatePurchaseIntentRequest) -> Result
 
 fn validate_purchase_quote_request(req: &CreatePurchaseQuoteRequest) -> Result<(), ApiError> {
     validate_purchase_items(&req.level_ids, &req.quantities)
+}
+
+fn validate_price_request(req: &TicketPricesRequest) -> Result<(), ApiError> {
+    if req.level_ids.is_empty() {
+        return Err(ApiError::bad_request("level_ids must not be empty"));
+    }
+    Ok(())
 }
 
 fn validate_purchase_items(level_ids: &[u8], quantities: &[u64]) -> Result<(), ApiError> {
@@ -995,8 +1048,8 @@ mod tests {
 
     use super::{
         create_purchase_intent, create_purchase_quote, get_purchase_intent, get_ticket, health,
-        list_tickets, notify_tickets, parse_token_amount, signin_challenge, signin_verify,
-        transfer_ticket, unix_now, validate_transfer_request, TransferTicketRequest,
+        list_ticket_prices, list_tickets, notify_tickets, parse_token_amount, signin_challenge,
+        signin_verify, transfer_ticket, unix_now, validate_transfer_request, TransferTicketRequest,
     };
     use crate::{
         auth::JwtCodec,
@@ -1105,6 +1158,7 @@ mod tests {
             .route("/health", get(health))
             .route("/signin/challenge", post(signin_challenge))
             .route("/signin", post(signin_verify))
+            .route("/purchase-prices", post(list_ticket_prices))
             .route("/purchase-quotes", post(create_purchase_quote))
             .route("/purchase-intents", post(create_purchase_intent))
             .route("/purchase-intents/:id", get(get_purchase_intent))
@@ -1219,6 +1273,44 @@ mod tests {
         }
         let json_body = serde_json::from_slice(&bytes).expect("json response expected");
         (status, json_body)
+    }
+
+    #[tokio::test]
+    async fn list_ticket_prices_reads_current_chain_quote_without_auth() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, _state) = build_test_app(mock_chain.clone()).await;
+        mock_chain.set_quote(
+            56,
+            &[1, 2, 3],
+            &[1, 1, 1],
+            QuoteResult {
+                total_amount: "2588000000000000000000".to_string(),
+                unit_prices: vec![
+                    "100000000000000000000".to_string(),
+                    "499000000000000000000".to_string(),
+                    "1989000000000000000000".to_string(),
+                ],
+            },
+        );
+
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/purchase-prices",
+            None,
+            Some(json!({
+                "chain_id": 56,
+                "level_ids": [1, 2, 3]
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["chain_id"], 56);
+        assert_eq!(body["prices"][0]["level_id"], 1);
+        assert_eq!(body["prices"][0]["unit_price"], "100000000000000000000");
+        assert_eq!(body["prices"][1]["unit_price"], "499000000000000000000");
+        assert_eq!(body["prices"][2]["unit_price"], "1989000000000000000000");
     }
 
     #[tokio::test]

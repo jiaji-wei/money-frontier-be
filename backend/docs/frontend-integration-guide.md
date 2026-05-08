@@ -1,4 +1,4 @@
-# Lili Ticket Frontend Integration Guide
+# Money Frontier Ticket Frontend Integration Guide
 
 本文档面向前端开发，目标是帮助你完成以下接入：
 
@@ -161,6 +161,8 @@ Authorization: Bearer <jwt>
 - `getPriceSchedule(uint8 level_id)`：如需展示时间段价格
 - `payment_tokens(token)`：如需校验某支付 token 是否启用（可选）
 
+前端展示当前票价时优先调用后端 `POST /purchase-prices`。该接口复用合约 `quote(level_ids, [1...])`，避免前端硬编码票价或自行解析价格时间表。
+
 常用写方法：
 
 - `purchaseWithAuthorization(address payment_token, uint8[] level_ids, uint256[] quantities, bytes32 intent_id, uint256 final_total_amount, uint64 expires_at, bytes signature)`
@@ -252,7 +254,7 @@ OpenAPI 源文件：
 
 ### 4.x Operations Admin APIs
 
-运营后台不要复用买家 JWT，也不要复用 `lili.auth.session`。前端实现应使用独立 session：
+运营后台不要复用买家 JWT，也不要复用 `moneyFrontier.auth.session`。前端实现应使用独立 session：
 
 ```ts
 {
@@ -266,7 +268,7 @@ OpenAPI 源文件：
 推荐浏览器 key：
 
 ```text
-lili.adminSession
+moneyFrontier.adminSession
 ```
 
 Admin 登录流程：
