@@ -335,11 +335,15 @@ Create request:
   "status": "active",
   "commission_type": "percentage",
   "commission_value": "1000",
+  "discount_type": "percentage",
+  "discount_value": "1000",
   "notes": "partner invite"
 }
 ```
 
 `beneficiary_wallet` 可在创建时省略，后续合作方提供钱包后再通过 `PATCH /admin/invite-codes/:id` 补充。未填写时不影响邀请码绑定和订单归因，但 referral settlement 会显示缺少收款钱包。
+
+邀请码可选配置 `discount_type` / `discount_value`，用于买家通过 referral 进入且未手动输入折扣码时自动享受折扣。手动折扣码优先于 referral 自动折扣。编辑时发送空字符串 `discount_type: ""` 和 `discount_value: ""` 可清空该自动买家折扣。
 
 #### Discount code APIs
 

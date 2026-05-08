@@ -113,6 +113,8 @@ Notes:
 - `created_at` INTEGER NOT NULL
 - `updated_at` INTEGER NOT NULL
 
+For `kind = referral`, `discount_type` and `discount_value` represent the optional automatic buyer discount applied from the referral when no manual discount code is provided. For `kind = discount`, those fields represent the standalone discount code rule.
+
 Indexes:
 - `idx_promotion_codes_kind_status(kind, status)`
 

@@ -269,6 +269,8 @@ pub struct NewInviteCode {
     pub status: String,
     pub commission_type: Option<String>,
     pub commission_value: Option<String>,
+    pub discount_type: Option<String>,
+    pub discount_value: Option<String>,
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
     pub notes: Option<String>,
@@ -280,6 +282,8 @@ pub struct UpdateInviteCode {
     pub status: Option<String>,
     pub commission_type: Option<String>,
     pub commission_value: Option<String>,
+    pub discount_type: Option<String>,
+    pub discount_value: Option<String>,
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
     pub notes: Option<String>,
@@ -892,7 +896,7 @@ ExpiresAt: {expires_at}"
                 notes,
                 created_at,
                 updated_at
-            ) VALUES (?1, 'referral', ?2, ?3, ?4, ?5, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, ?6, ?7, ?8, ?9, ?9)
+            ) VALUES (?1, 'referral', ?2, ?3, ?4, ?5, NULL, NULL, 0, NULL, NULL, NULL, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?11)
             "#,
         )
         .bind(&normalized)
@@ -900,6 +904,8 @@ ExpiresAt: {expires_at}"
         .bind(input.beneficiary_wallet)
         .bind(input.valid_from)
         .bind(input.valid_until)
+        .bind(input.discount_type)
+        .bind(input.discount_value)
         .bind(input.commission_type)
         .bind(input.commission_value)
         .bind(input.notes)
@@ -932,10 +938,12 @@ ExpiresAt: {expires_at}"
                 status = COALESCE(?3, status),
                 commission_type = COALESCE(?4, commission_type),
                 commission_value = COALESCE(?5, commission_value),
-                valid_from = COALESCE(?6, valid_from),
-                valid_until = COALESCE(?7, valid_until),
-                notes = COALESCE(?8, notes),
-                updated_at = ?9
+                discount_type = CASE WHEN ?6 = '' THEN NULL ELSE COALESCE(?6, discount_type) END,
+                discount_value = CASE WHEN ?7 = '' THEN NULL ELSE COALESCE(?7, discount_value) END,
+                valid_from = COALESCE(?8, valid_from),
+                valid_until = COALESCE(?9, valid_until),
+                notes = COALESCE(?10, notes),
+                updated_at = ?11
             WHERE id = ?1
               AND kind = 'referral'
             "#,
@@ -945,6 +953,8 @@ ExpiresAt: {expires_at}"
         .bind(input.status)
         .bind(input.commission_type)
         .bind(input.commission_value)
+        .bind(input.discount_type)
+        .bind(input.discount_value)
         .bind(input.valid_from)
         .bind(input.valid_until)
         .bind(input.notes)

@@ -292,6 +292,8 @@ pub struct CreateInviteCodeRequest {
     pub status: String,
     pub commission_type: Option<String>,
     pub commission_value: Option<String>,
+    pub discount_type: Option<String>,
+    pub discount_value: Option<String>,
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
     pub notes: Option<String>,
@@ -300,11 +302,16 @@ pub struct CreateInviteCodeRequest {
 pub async fn create_invite_code(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<CreateInviteCodeRequest>,
+    Json(mut req): Json<CreateInviteCodeRequest>,
 ) -> Result<Json<PromotionCodeRow>, ApiError> {
     let principal = authenticate_admin(&state, &headers).await?;
     require_role(&principal, &[AdminRole::Operator])?;
     validate_promotion_status(&req.status)?;
+    validate_optional_discount_value(req.discount_type.as_deref(), req.discount_value.as_deref())?;
+    if req.discount_type.as_deref() == Some("") && req.discount_value.as_deref() == Some("") {
+        req.discount_type = None;
+        req.discount_value = None;
+    }
     let code = normalize_new_invite_code(&req.code).map_err(ApiError::bad_request)?;
 
     if state
@@ -326,6 +333,8 @@ pub async fn create_invite_code(
             status: req.status,
             commission_type: req.commission_type,
             commission_value: req.commission_value,
+            discount_type: req.discount_type,
+            discount_value: req.discount_value,
             valid_from: req.valid_from,
             valid_until: req.valid_until,
             notes: req.notes,
@@ -379,6 +388,8 @@ pub struct UpdateInviteCodeRequest {
     pub status: Option<String>,
     pub commission_type: Option<String>,
     pub commission_value: Option<String>,
+    pub discount_type: Option<String>,
+    pub discount_value: Option<String>,
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
     pub notes: Option<String>,
@@ -396,6 +407,7 @@ pub async fn update_invite_code(
     if let Some(status) = req.status.as_deref() {
         validate_promotion_status(status)?;
     }
+    validate_optional_discount_value(req.discount_type.as_deref(), req.discount_value.as_deref())?;
     let beneficiary_wallet = normalize_optional_wallet_address(req.beneficiary_wallet.as_deref())?;
     let before = state
         .db
@@ -412,6 +424,8 @@ pub async fn update_invite_code(
                 status: req.status,
                 commission_type: req.commission_type,
                 commission_value: req.commission_value,
+                discount_type: req.discount_type,
+                discount_value: req.discount_value,
                 valid_from: req.valid_from,
                 valid_until: req.valid_until,
                 notes: req.notes,
@@ -1193,6 +1207,25 @@ fn validate_discount_value(discount_type: &str, discount_value: &str) -> Result<
     }
 }
 
+fn validate_optional_discount_value(
+    discount_type: Option<&str>,
+    discount_value: Option<&str>,
+) -> Result<(), ApiError> {
+    match (discount_type, discount_value) {
+        (Some(""), Some("")) => Ok(()),
+        (Some(discount_type), Some(discount_value)) => {
+            validate_discount_value(discount_type, discount_value)
+        }
+        (Some(_), None) => Err(ApiError::bad_request(
+            "discount value is required when discount type is selected",
+        )),
+        (None, Some(_)) => Err(ApiError::bad_request(
+            "discount type is required when discount value is selected",
+        )),
+        (None, None) => Ok(()),
+    }
+}
+
 fn validate_human_token_amount(value: &str) -> Result<(), ApiError> {
     let normalized = value.trim();
     if normalized.is_empty() || normalized.starts_with('-') {
@@ -1961,13 +1994,17 @@ mod tests {
                 "code": "NOWALLET",
                 "status": "active",
                 "commission_type": "percentage",
-                "commission_value": "1000"
+                "commission_value": "1000",
+                "discount_type": "percentage",
+                "discount_value": "1000"
             })),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["code_normalized"], "NOWALLET");
         assert!(body["beneficiary_wallet"].is_null());
+        assert_eq!(body["discount_type"], "percentage");
+        assert_eq!(body["discount_value"], "1000");
 
         let id = body["id"].as_i64().expect("invite id should exist");
         let (status, updated) = json_request(
@@ -1985,6 +2022,21 @@ mod tests {
             updated["beneficiary_wallet"],
             "0x2222222222222222222222222222222222222222"
         );
+
+        let (status, updated) = json_request(
+            &app,
+            Method::PATCH,
+            &format!("/invite-codes/{id}"),
+            Some(&token),
+            Some(json!({
+                "discount_type": "",
+                "discount_value": ""
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(updated["discount_type"].is_null());
+        assert!(updated["discount_value"].is_null());
     }
 
     #[tokio::test]
@@ -2616,6 +2668,8 @@ mod tests {
                     status: None,
                     commission_type: Some("percentage".to_string()),
                     commission_value: Some("1000".to_string()),
+                    discount_type: None,
+                    discount_value: None,
                     valid_from: None,
                     valid_until: None,
                     notes: None,

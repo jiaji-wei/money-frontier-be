@@ -853,6 +853,15 @@ components:
         commission_value:
           type: string
           nullable: true
+        discount_type:
+          type: string
+          nullable: true
+          enum: [fixed, percentage]
+          description: Optional automatic buyer discount applied when this referral is captured and no manual discount code is entered.
+        discount_value:
+          type: string
+          nullable: true
+          description: For percentage, basis points. For fixed, human-readable token amount; backend converts with the selected payment token decimals at purchase-intent time.
         notes:
           type: string
           nullable: true
