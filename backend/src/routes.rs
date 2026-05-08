@@ -263,18 +263,37 @@ pub async fn create_purchase_intent(
     let (referral_code_id, referral_binding_status) =
         resolve_purchase_referral_binding(&state, &wallet, req.referral_code.as_deref()).await?;
 
-    let (discount_code_id, discount_amount) = resolve_discount(
-        &state,
-        &wallet,
-        req.chain_id,
-        &payment_token,
-        &req.level_ids,
-        req.discount_code.as_deref(),
-        referral_code_id.is_some(),
-        original_total,
-        DiscountResolutionMode::CreateIntent,
-    )
-    .await?;
+    let discount_code_present = req
+        .discount_code
+        .as_deref()
+        .and_then(normalize_promotion_code)
+        .is_some();
+    let (discount_code_id, discount_amount) = if discount_code_present {
+        resolve_discount(
+            &state,
+            &wallet,
+            req.chain_id,
+            &payment_token,
+            &req.level_ids,
+            req.discount_code.as_deref(),
+            referral_code_id.is_some(),
+            original_total,
+            DiscountResolutionMode::CreateIntent,
+        )
+        .await?
+    } else {
+        (
+            None,
+            resolve_referral_auto_discount(
+                &state,
+                req.chain_id,
+                &payment_token,
+                referral_code_id,
+                original_total,
+            )
+            .await?,
+        )
+    };
 
     let final_total = original_total.saturating_sub(discount_amount);
     let expires_at = unix_now() + state.config.purchase_intent_ttl_secs;
@@ -372,30 +391,52 @@ pub async fn create_purchase_quote(
     let (referral_code_id, referral_binding_status) =
         resolve_purchase_referral_preview(&state, &wallet, req.referral_code.as_deref()).await?;
 
-    let (discount_code_id, discount_amount) = resolve_discount(
-        &state,
-        &wallet,
-        req.chain_id,
-        &payment_token,
-        &req.level_ids,
-        req.discount_code.as_deref(),
-        referral_code_id.is_some(),
-        original_total,
-        DiscountResolutionMode::Preview,
-    )
-    .await?;
-
-    let final_total = original_total.saturating_sub(discount_amount);
     let discount_code_present = req
         .discount_code
         .as_deref()
         .and_then(normalize_promotion_code)
         .is_some();
-    let (discount_status, discount_message) = match (discount_code_id, discount_amount.is_zero()) {
-        (Some(_), false) => ("applied", "Discount applied"),
-        (Some(_), true) => ("no_discount", "Discount code did not reduce this order"),
-        (None, _) if discount_code_present => ("no_discount", "No discount applied"),
-        (None, _) => ("none", "No discount code"),
+    let (discount_code_id, discount_amount) = if discount_code_present {
+        resolve_discount(
+            &state,
+            &wallet,
+            req.chain_id,
+            &payment_token,
+            &req.level_ids,
+            req.discount_code.as_deref(),
+            referral_code_id.is_some(),
+            original_total,
+            DiscountResolutionMode::Preview,
+        )
+        .await?
+    } else {
+        (
+            None,
+            resolve_referral_auto_discount(
+                &state,
+                req.chain_id,
+                &payment_token,
+                referral_code_id,
+                original_total,
+            )
+            .await?,
+        )
+    };
+
+    let final_total = original_total.saturating_sub(discount_amount);
+    let referral_code_present = referral_code_id.is_some();
+    let (discount_status, discount_message) = match (
+        discount_code_id,
+        discount_amount.is_zero(),
+        discount_code_present,
+        referral_code_present,
+    ) {
+        (Some(_), false, _, _) => ("applied", "Discount applied"),
+        (Some(_), true, _, _) => ("no_discount", "Discount code did not reduce this order"),
+        (None, false, false, _) => ("applied", "Referral discount applied"),
+        (None, true, false, true) => ("no_discount", "No referral discount configured"),
+        (None, _, true, _) => ("no_discount", "No discount applied"),
+        (None, _, false, false) => ("none", "No discount code"),
     };
 
     Ok(Json(CreatePurchaseQuoteResponse {
@@ -839,6 +880,52 @@ async fn resolve_discount(
         };
     let discount_amount = calculate_discount_amount(&code, original_total, token_decimals)?;
     Ok((Some(code.id), discount_amount))
+}
+
+async fn resolve_referral_auto_discount(
+    state: &Arc<AppState>,
+    chain_id: u64,
+    payment_token: &str,
+    referral_code_id: Option<i64>,
+    original_total: U256,
+) -> Result<U256, ApiError> {
+    let Some(referral_code_id) = referral_code_id else {
+        return Ok(U256::zero());
+    };
+
+    let Some(code) = state
+        .db
+        .get_invite_code_detail(referral_code_id)
+        .await
+        .map_err(|err| ApiError::internal(format!("load invite code failed: {err}")))?
+    else {
+        return Ok(U256::zero());
+    };
+
+    if code.kind != "referral" || code.status != "active" {
+        return Ok(U256::zero());
+    }
+    let now = unix_now();
+    if code.valid_from.is_some_and(|value| value > now)
+        || code.valid_until.is_some_and(|value| value < now)
+        || code.discount_type.is_none()
+        || code.discount_value.is_none()
+    {
+        return Ok(U256::zero());
+    }
+
+    let token_decimals =
+        if code.discount_type.as_deref() == Some("fixed") || code.max_discount_amount.is_some() {
+            Some(
+                payment_token_decimals(chain_id, payment_token).ok_or_else(|| {
+                    ApiError::bad_request("payment token decimals are not configured")
+                })?,
+            )
+        } else {
+            None
+        };
+
+    calculate_discount_amount(&code, original_total, token_decimals)
 }
 
 async fn validate_discount_code(
@@ -1730,6 +1817,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_purchase_quote_applies_referral_auto_discount_without_discount_code() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain.clone()).await;
+
+        let referral_code_id = state
+            .db
+            .seed_referral_code("partner")
+            .await
+            .expect("referral code seed should succeed");
+        state
+            .db
+            .update_invite_code(
+                referral_code_id,
+                UpdateInviteCode {
+                    beneficiary_wallet: None,
+                    status: None,
+                    commission_type: None,
+                    commission_value: None,
+                    discount_type: Some("percentage".to_string()),
+                    discount_value: Some("1000".to_string()),
+                    valid_from: None,
+                    valid_until: None,
+                    notes: None,
+                },
+            )
+            .await
+            .expect("referral buyer discount seed should succeed");
+        mock_chain.set_quote(
+            56,
+            &[1],
+            &[1],
+            QuoteResult {
+                total_amount: "100000000000000000000".to_string(),
+                unit_prices: vec!["100000000000000000000".to_string()],
+            },
+        );
+        let wallet_address = "0x0030457e79159bed97aee6eea708441d4cff579b";
+        let (token, _) = state.jwt.issue(wallet_address).expect("jwt should issue");
+
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/purchase-quotes",
+            Some(&token),
+            Some(json!({
+                "chain_id": 56,
+                "payment_token": "0xed7b83bf2862Ea0F702C76064004EFFCd0f4b1D5",
+                "level_ids": [1],
+                "quantities": [1],
+                "referral_code": "partner"
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["referral_binding_status"], "would_bind");
+        assert_eq!(body["discount_amount"], "10000000000000000000");
+        assert_eq!(body["final_total_amount"], "90000000000000000000");
+        assert_eq!(body["discount_status"], "applied");
+        assert_eq!(body["discount_message"], "Referral discount applied");
+    }
+
+    #[tokio::test]
+    async fn create_purchase_intent_prefers_manual_discount_over_referral_auto_discount() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain.clone()).await;
+
+        let referral_code_id = state
+            .db
+            .seed_referral_code("partner")
+            .await
+            .expect("referral code seed should succeed");
+        state
+            .db
+            .update_invite_code(
+                referral_code_id,
+                UpdateInviteCode {
+                    beneficiary_wallet: None,
+                    status: None,
+                    commission_type: None,
+                    commission_value: None,
+                    discount_type: Some("percentage".to_string()),
+                    discount_value: Some("1000".to_string()),
+                    valid_from: None,
+                    valid_until: None,
+                    notes: None,
+                },
+            )
+            .await
+            .expect("referral buyer discount seed should succeed");
+        let discount_code_id = state
+            .db
+            .seed_fixed_discount_code("manual20", "20")
+            .await
+            .expect("discount code seed should succeed");
+        mock_chain.set_quote(
+            56,
+            &[1],
+            &[1],
+            QuoteResult {
+                total_amount: "100000000000000000000".to_string(),
+                unit_prices: vec!["100000000000000000000".to_string()],
+            },
+        );
+        let wallet_address = "0x0030457e79159bed97aee6eea708441d4cff579b";
+        let (token, _) = state.jwt.issue(wallet_address).expect("jwt should issue");
+
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/purchase-intents",
+            Some(&token),
+            Some(json!({
+                "chain_id": 56,
+                "payment_token": "0xed7b83BF2862Ea0F702C76064004EFFCd0f4b1D5",
+                "level_ids": [1],
+                "quantities": [1],
+                "referral_code": "partner",
+                "discount_code": "manual20"
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["discount_amount"], "20000000000000000000");
+        assert_eq!(body["final_total_amount"], "80000000000000000000");
+        let intent = state
+            .db
+            .get_purchase_intent(body["intent_id"].as_str().expect("intent id should exist"))
+            .await
+            .expect("purchase intent lookup should succeed")
+            .expect("purchase intent should exist");
+        assert_eq!(intent.referral_code_id, Some(referral_code_id));
+        assert_eq!(intent.discount_code_id, Some(discount_code_id));
+    }
+
+    #[tokio::test]
     async fn create_purchase_quote_ignores_existing_pending_reservation_for_same_wallet() {
         let mock_chain = Arc::new(MockChain::default());
         let (app, state) = build_test_app(mock_chain.clone()).await;
@@ -2029,6 +2253,8 @@ mod tests {
                     status: None,
                     commission_type: Some("percentage".to_string()),
                     commission_value: Some("1000".to_string()),
+                    discount_type: None,
+                    discount_value: None,
                     valid_from: None,
                     valid_until: None,
                     notes: None,
