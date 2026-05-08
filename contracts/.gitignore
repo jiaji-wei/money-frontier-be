@@ -4,6 +4,7 @@ out/
 
 # Ignores development broadcast logs
 /broadcast/
+/logs/
 
 # Docs
 docs/
@@ -11,3 +12,5 @@ docs/
 # Dotenv file
 .env
 .env.example
+.env.deploy.*
+templates/*.env
