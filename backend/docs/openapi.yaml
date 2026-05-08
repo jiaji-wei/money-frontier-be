@@ -88,6 +88,27 @@ paths:
         "401":
           description: Unauthorized
 
+  /purchase-prices:
+    post:
+      tags: [tickets]
+      summary: Read current ticket unit prices from chain quote
+      description: Public endpoint for rendering current ticket prices. It calls the sale contract quote path with quantity 1 for each requested level and does not create a purchase intent or apply discounts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TicketPricesRequest"
+      responses:
+        "200":
+          description: Current ticket prices
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TicketPricesResponse"
+        "400":
+          description: Invalid request, unsupported chain, or chain quote failure
+
   /purchase-intents:
     post:
       tags: [tickets]
@@ -1082,6 +1103,40 @@ components:
           type: string
           nullable: true
           description: Optional first-bind referral code, ignored when wallet is already bound
+
+    TicketPricesRequest:
+      type: object
+      required: [chain_id, level_ids]
+      properties:
+        chain_id:
+          type: integer
+          format: int64
+        level_ids:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+
+    TicketPricesResponse:
+      type: object
+      required: [chain_id, prices]
+      properties:
+        chain_id:
+          type: integer
+          format: int64
+        prices:
+          type: array
+          items:
+            type: object
+            required: [level_id, unit_price]
+            properties:
+              level_id:
+                type: integer
+                minimum: 0
+                maximum: 255
+              unit_price:
+                type: string
 
     CreatePurchaseIntentResponse:
       type: object

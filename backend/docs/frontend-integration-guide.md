@@ -161,6 +161,8 @@ Authorization: Bearer <jwt>
 - `getPriceSchedule(uint8 level_id)`：如需展示时间段价格
 - `payment_tokens(token)`：如需校验某支付 token 是否启用（可选）
 
+前端展示当前票价时优先调用后端 `POST /purchase-prices`。该接口复用合约 `quote(level_ids, [1...])`，避免前端硬编码票价或自行解析价格时间表。
+
 常用写方法：
 
 - `purchaseWithAuthorization(address payment_token, uint8[] level_ids, uint256[] quantities, bytes32 intent_id, uint256 final_total_amount, uint64 expires_at, bytes signature)`

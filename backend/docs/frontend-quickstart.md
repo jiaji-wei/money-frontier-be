@@ -163,6 +163,8 @@ Authorization: Bearer <jwt>
 - `currentPrice(uint8 level_id)`
 - `getPriceSchedule(uint8 level_id)`（如果要展示时间段价格）
 
+前端展示当前票价时优先调用后端 `POST /purchase-prices`，后端会通过合约 `quote(level_ids, [1...])` 返回链上实时单价。
+
 写入：
 
 - `purchaseWithAuthorization(address payment_token, uint8[] level_ids, uint256[] quantities, bytes32 intent_id, uint256 final_total_amount, uint64 expires_at, bytes signature)`
