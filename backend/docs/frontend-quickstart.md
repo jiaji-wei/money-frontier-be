@@ -1,4 +1,4 @@
-# Lili Ticket Frontend Quickstart
+# Money Frontier Ticket Frontend Quickstart
 
 本文档是给前端同学的精简接入版，目标是快速完成可用联调。
 

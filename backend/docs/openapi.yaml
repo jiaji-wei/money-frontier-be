@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: Lili Ticket Backend API
+  title: Money Frontier Ticket Backend API
   version: "0.1.0"
 servers:
   - url: http://localhost:8080

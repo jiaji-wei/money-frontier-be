@@ -1,4 +1,4 @@
-# Lili Ticket Frontend Integration Guide
+# Money Frontier Ticket Frontend Integration Guide
 
 本文档面向前端开发，目标是帮助你完成以下接入：
 
@@ -252,7 +252,7 @@ OpenAPI 源文件：
 
 ### 4.x Operations Admin APIs
 
-运营后台不要复用买家 JWT，也不要复用 `lili.auth.session`。前端实现应使用独立 session：
+运营后台不要复用买家 JWT，也不要复用 `moneyFrontier.auth.session`。前端实现应使用独立 session：
 
 ```ts
 {
@@ -266,7 +266,7 @@ OpenAPI 源文件：
 推荐浏览器 key：
 
 ```text
-lili.adminSession
+moneyFrontier.adminSession
 ```
 
 Admin 登录流程：
