@@ -449,6 +449,48 @@ pub async fn create_purchase_quote(
     }))
 }
 
+pub async fn create_referral_purchase_quote(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreatePurchaseQuoteRequest>,
+) -> Result<Json<CreatePurchaseQuoteResponse>, ApiError> {
+    validate_purchase_quote_request(&req)?;
+
+    let payment_token = normalize_wallet_address(&req.payment_token)?;
+    find_chain_config(&state.config.chains, req.chain_id)?;
+
+    let quote = state
+        .chain
+        .quote_purchase(req.chain_id, &req.level_ids, &req.quantities)
+        .await
+        .map_err(|err| ApiError::bad_request(format!("failed to quote purchase: {err}")))?;
+    let original_total = parse_u256_decimal(&quote.total_amount)?;
+    let (referral_code_id, referral_binding_status) =
+        resolve_public_referral_preview(&state, req.referral_code.as_deref()).await?;
+    let discount_amount = resolve_referral_auto_discount(
+        &state,
+        req.chain_id,
+        &payment_token,
+        referral_code_id,
+        original_total,
+    )
+    .await?;
+    let final_total = original_total.saturating_sub(discount_amount);
+    let (discount_status, discount_message) = match (referral_code_id, discount_amount.is_zero()) {
+        (Some(_), false) => ("applied", "Referral discount applied"),
+        (Some(_), true) => ("no_discount", "No referral discount configured"),
+        (None, _) => ("no_discount", "No referral discount available"),
+    };
+
+    Ok(Json(CreatePurchaseQuoteResponse {
+        original_total_amount: original_total.to_string(),
+        discount_amount: discount_amount.to_string(),
+        final_total_amount: final_total.to_string(),
+        discount_status: discount_status.to_string(),
+        discount_message: discount_message.to_string(),
+        referral_binding_status,
+    }))
+}
+
 pub async fn list_ticket_prices(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TicketPricesRequest>,
@@ -753,6 +795,28 @@ async fn resolve_purchase_referral_preview(
         ));
     }
 
+    let Some(referral_code) = referral_code.and_then(normalize_promotion_code) else {
+        return Ok((None, None));
+    };
+
+    let promotion_code = state
+        .db
+        .find_promotion_code(&referral_code)
+        .await
+        .map_err(|err| ApiError::internal(format!("load referral code failed: {err}")))?;
+
+    match promotion_code {
+        Some(code) if code.kind == "referral" && code.status == "active" => {
+            Ok((Some(code.id), Some("would_bind".to_string())))
+        }
+        _ => Ok((None, Some("invalid".to_string()))),
+    }
+}
+
+async fn resolve_public_referral_preview(
+    state: &Arc<AppState>,
+    referral_code: Option<&str>,
+) -> Result<(Option<i64>, Option<String>), ApiError> {
     let Some(referral_code) = referral_code.and_then(normalize_promotion_code) else {
         return Ok((None, None));
     };
@@ -1134,9 +1198,10 @@ mod tests {
     use tower::util::ServiceExt;
 
     use super::{
-        create_purchase_intent, create_purchase_quote, get_purchase_intent, get_ticket, health,
-        list_ticket_prices, list_tickets, notify_tickets, parse_token_amount, signin_challenge,
-        signin_verify, transfer_ticket, unix_now, validate_transfer_request, TransferTicketRequest,
+        create_purchase_intent, create_purchase_quote, create_referral_purchase_quote,
+        get_purchase_intent, get_ticket, health, list_ticket_prices, list_tickets, notify_tickets,
+        parse_token_amount, signin_challenge, signin_verify, transfer_ticket, unix_now,
+        validate_transfer_request, TransferTicketRequest,
     };
     use crate::{
         auth::JwtCodec,
@@ -1247,6 +1312,10 @@ mod tests {
             .route("/signin", post(signin_verify))
             .route("/purchase-prices", post(list_ticket_prices))
             .route("/purchase-quotes", post(create_purchase_quote))
+            .route(
+                "/purchase-referral-quotes",
+                post(create_referral_purchase_quote),
+            )
             .route("/purchase-intents", post(create_purchase_intent))
             .route("/purchase-intents/:id", get(get_purchase_intent))
             .route("/tickets", get(list_tickets).post(notify_tickets))
@@ -1877,6 +1946,70 @@ mod tests {
         assert_eq!(body["final_total_amount"], "90000000000000000000");
         assert_eq!(body["discount_status"], "applied");
         assert_eq!(body["discount_message"], "Referral discount applied");
+    }
+
+    #[tokio::test]
+    async fn create_referral_purchase_quote_previews_referral_discount_without_auth() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain.clone()).await;
+
+        let referral_code_id = state
+            .db
+            .seed_referral_code("partner")
+            .await
+            .expect("referral code seed should succeed");
+        state
+            .db
+            .update_invite_code(
+                referral_code_id,
+                UpdateInviteCode {
+                    beneficiary_wallet: None,
+                    status: None,
+                    commission_type: None,
+                    commission_value: None,
+                    discount_type: Some("percentage".to_string()),
+                    discount_value: Some("1000".to_string()),
+                    valid_from: None,
+                    valid_until: None,
+                    notes: None,
+                },
+            )
+            .await
+            .expect("referral buyer discount seed should succeed");
+        mock_chain.set_quote(
+            56,
+            &[1],
+            &[1],
+            QuoteResult {
+                total_amount: "88000000000000000000".to_string(),
+                unit_prices: vec!["88000000000000000000".to_string()],
+            },
+        );
+
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/purchase-referral-quotes",
+            None,
+            Some(json!({
+                "chain_id": 56,
+                "payment_token": "0x55d398326f99059ff775485246999027b3197955",
+                "level_ids": [1],
+                "quantities": [1],
+                "referral_code": "partner"
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["original_total_amount"], "88000000000000000000");
+        assert_eq!(body["discount_amount"], "8800000000000000000");
+        assert_eq!(body["final_total_amount"], "79200000000000000000");
+        assert_eq!(body["discount_status"], "applied");
+        assert_eq!(body["discount_message"], "Referral discount applied");
+        assert_eq!(body["referral_binding_status"], "would_bind");
+        assert!(body.get("intent_id").is_none());
+        assert!(body.get("signature").is_none());
     }
 
     #[tokio::test]
