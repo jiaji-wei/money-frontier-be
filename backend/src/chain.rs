@@ -293,18 +293,30 @@ impl ChainService {
 
     async fn has_default_admin_role_via_rpc(&self, wallet: &str) -> anyhow::Result<bool> {
         let wallet = Address::from_str(wallet).context("invalid admin wallet address")?;
+        let mut has_successful_check = false;
         let mut last_error = None;
 
-        for client in self.clients.values() {
+        for (chain_id, client) in &self.clients {
             match client.has_default_admin_role(wallet).await {
                 Ok(true) => return Ok(true),
-                Ok(false) => {}
-                Err(err) => last_error = Some(err),
+                Ok(false) => has_successful_check = true,
+                Err(err) => {
+                    tracing::warn!(
+                        chain_id,
+                        error = %err,
+                        "admin chain role check failed on one configured chain"
+                    );
+                    last_error = Some(err);
+                }
             }
         }
 
+        if has_successful_check {
+            return Ok(false);
+        }
+
         if let Some(err) = last_error {
-            return Err(err).context("check DEFAULT_ADMIN_ROLE failed");
+            return Err(err).context("check chain admin role failed");
         }
 
         Ok(false)
@@ -313,6 +325,70 @@ impl ChainService {
 
 impl ChainClient {
     async fn has_default_admin_role(&self, wallet: Address) -> anyhow::Result<bool> {
+        let mut last_error = None;
+
+        match self.owner().await {
+            Ok(owner) if owner == wallet => return Ok(true),
+            Ok(_) => {}
+            Err(err) => last_error = Some(err.context("check owner() failed")),
+        }
+
+        match self.default_admin().await {
+            Ok(default_admin) if default_admin == wallet => return Ok(true),
+            Ok(_) => {}
+            Err(err) => last_error = Some(err.context("check defaultAdmin() failed")),
+        }
+
+        match self.has_role([0; 32], wallet).await {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                if let Some(previous_err) = last_error {
+                    tracing::debug!(
+                        error = %previous_err,
+                        "owner/defaultAdmin admin checks were not available"
+                    );
+                }
+                Err(err).context("check DEFAULT_ADMIN_ROLE failed")
+            }
+        }
+    }
+
+    async fn owner(&self) -> anyhow::Result<Address> {
+        self.call_address_view("owner").await
+    }
+
+    async fn default_admin(&self) -> anyhow::Result<Address> {
+        self.call_address_view("defaultAdmin").await
+    }
+
+    async fn call_address_view(&self, name: &str) -> anyhow::Result<Address> {
+        #[allow(deprecated)]
+        let function = Function {
+            name: name.to_string(),
+            inputs: Vec::new(),
+            outputs: vec![Param {
+                name: "account".to_string(),
+                kind: ParamType::Address,
+                internal_type: None,
+            }],
+            constant: None,
+            state_mutability: StateMutability::View,
+        };
+
+        let calldata = function.encode_input(&[])?;
+        let tx = TransactionRequest::new()
+            .to(self.sale_contract)
+            .data(Bytes::from(calldata));
+        let raw = self.provider.call(&tx.into(), None).await?;
+        let decoded = function.decode_output(raw.as_ref())?;
+
+        match &decoded[0] {
+            Token::Address(value) => Ok(*value),
+            _ => anyhow::bail!("{name} returned unexpected type"),
+        }
+    }
+
+    async fn has_role(&self, role: [u8; 32], wallet: Address) -> anyhow::Result<bool> {
         #[allow(deprecated)]
         let function = Function {
             name: "hasRole".to_string(),
@@ -338,7 +414,7 @@ impl ChainClient {
         };
 
         let calldata =
-            function.encode_input(&[Token::FixedBytes(vec![0; 32]), Token::Address(wallet)])?;
+            function.encode_input(&[Token::FixedBytes(role.to_vec()), Token::Address(wallet)])?;
         let tx = TransactionRequest::new()
             .to(self.sale_contract)
             .data(Bytes::from(calldata));

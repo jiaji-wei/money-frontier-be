@@ -162,13 +162,16 @@ async fn resolve_admin_wallet_role(
     state: &Arc<AppState>,
     wallet: &str,
 ) -> Result<Option<AdminRole>, ApiError> {
-    if state
-        .chain
-        .has_default_admin_role(wallet)
-        .await
-        .map_err(|err| ApiError::internal(format!("check admin chain role failed: {err}")))?
-    {
-        return Ok(Some(AdminRole::Admin));
+    match state.chain.has_default_admin_role(wallet).await {
+        Ok(true) => return Ok(Some(AdminRole::Admin)),
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                wallet,
+                error = %err,
+                "admin chain role check failed; falling back to database admin wallets"
+            );
+        }
     }
 
     state
@@ -1328,6 +1331,7 @@ mod tests {
 
     struct NoopChain {
         default_admin_wallets: Vec<String>,
+        fail_admin_check: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -1381,6 +1385,10 @@ mod tests {
         }
 
         async fn has_default_admin_role(&self, wallet: &str) -> anyhow::Result<bool> {
+            if self.fail_admin_check {
+                anyhow::bail!("simulated chain admin role check failure");
+            }
+
             Ok(self
                 .default_admin_wallets
                 .iter()
@@ -1404,6 +1412,14 @@ mod tests {
     async fn build_test_app_with_chain_admins(
         admin_wallets: Vec<TestAdminWallet>,
         default_admin_wallets: Vec<String>,
+    ) -> (Router, Arc<AppState>) {
+        build_test_app_with_chain_admin_options(admin_wallets, default_admin_wallets, false).await
+    }
+
+    async fn build_test_app_with_chain_admin_options(
+        admin_wallets: Vec<TestAdminWallet>,
+        default_admin_wallets: Vec<String>,
+        fail_admin_check: bool,
     ) -> (Router, Arc<AppState>) {
         let database_url = "sqlite::memory:".to_string();
         let db = Db::connect(&database_url)
@@ -1454,6 +1470,7 @@ mod tests {
             db,
             chain: Arc::new(NoopChain {
                 default_admin_wallets,
+                fail_admin_check,
             }),
             jwt,
             mailer,
@@ -1475,6 +1492,12 @@ mod tests {
         }
 
         (super::router().with_state(state.clone()), state)
+    }
+
+    async fn build_test_app_with_failing_admin_chain(
+        admin_wallets: Vec<TestAdminWallet>,
+    ) -> (Router, Arc<AppState>) {
+        build_test_app_with_chain_admin_options(admin_wallets, Vec::new(), true).await
     }
 
     async fn json_request(
@@ -1609,6 +1632,58 @@ mod tests {
         assert_eq!(verify_body["wallet"], wallet_address);
         assert_eq!(verify_body["role"], "operator");
         assert!(verify_body["token"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn admin_auth_flow_db_wallet_still_works_when_chain_role_check_fails() {
+        let wallet: LocalWallet =
+            "0x59c6995e998f97a5a0044966f09453880a61fdbf87f6ea0f0f8a7ecf7f5f91f7"
+                .parse()
+                .expect("wallet parse should succeed");
+        let wallet_address = format!("{:#x}", wallet.address());
+        let (app, _state) = build_test_app_with_failing_admin_chain(vec![admin_config(
+            &wallet_address,
+            "operator",
+        )])
+        .await;
+
+        let (status, challenge_body) = json_request(
+            &app,
+            Method::POST,
+            "/auth/challenge",
+            None,
+            Some(json!({ "address": wallet_address })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let challenge_id = challenge_body["challenge_id"]
+            .as_str()
+            .expect("challenge id should exist");
+        let challenge_message = challenge_body["challenge_message"]
+            .as_str()
+            .expect("challenge message should exist");
+
+        let signature = wallet
+            .sign_message(challenge_message.to_string())
+            .await
+            .expect("message signing should succeed");
+
+        let (status, verify_body) = json_request(
+            &app,
+            Method::POST,
+            "/auth/verify",
+            None,
+            Some(json!({
+                "address": wallet_address,
+                "challenge_id": challenge_id,
+                "signature": signature.to_string()
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(verify_body["wallet"], wallet_address);
+        assert_eq!(verify_body["role"], "operator");
     }
 
     #[tokio::test]
