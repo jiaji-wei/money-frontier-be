@@ -160,6 +160,9 @@ pub struct ReferralSettlementRow {
     pub invite_code_id: i64,
     pub invite_code: String,
     pub beneficiary_wallet: Option<String>,
+    pub chain_id: i64,
+    pub payment_token: String,
+    pub payment_token_decimals: Option<u8>,
     pub confirmed_order_count: i64,
     pub paid_amount_total: String,
     pub commission_base_amount_total: String,
@@ -199,6 +202,9 @@ struct ReferralSettlementAccumulator {
     invite_code_id: i64,
     invite_code: String,
     beneficiary_wallet: Option<String>,
+    chain_id: i64,
+    payment_token: String,
+    payment_token_decimals: Option<u8>,
     confirmed_order_count: i64,
     paid_amount_total: U256,
     commission_base_amount_total: U256,
@@ -211,6 +217,9 @@ impl ReferralSettlementAccumulator {
             invite_code_id: self.invite_code_id,
             invite_code: self.invite_code,
             beneficiary_wallet: self.beneficiary_wallet,
+            chain_id: self.chain_id,
+            payment_token: self.payment_token,
+            payment_token_decimals: self.payment_token_decimals,
             confirmed_order_count: self.confirmed_order_count,
             paid_amount_total: self.paid_amount_total.to_string(),
             commission_base_amount_total: self.commission_base_amount_total.to_string(),
@@ -1946,19 +1955,26 @@ ExpiresAt: {expires_at}"
         .fetch_all(&self.pool)
         .await?;
 
-        let mut grouped: HashMap<i64, ReferralSettlementAccumulator> = HashMap::new();
+        let mut grouped: HashMap<(i64, i64, String), ReferralSettlementAccumulator> =
+            HashMap::new();
         for row in rows {
-            let entry = grouped.entry(row.invite_code_id).or_insert_with(|| {
-                ReferralSettlementAccumulator {
+            let payment_token_key = row.payment_token.trim().to_ascii_lowercase();
+            let payment_token_decimals =
+                payment_token_decimals(row.chain_id as u64, &row.payment_token);
+            let entry = grouped
+                .entry((row.invite_code_id, row.chain_id, payment_token_key))
+                .or_insert_with(|| ReferralSettlementAccumulator {
                     invite_code_id: row.invite_code_id,
-                    invite_code: row.invite_code,
-                    beneficiary_wallet: row.beneficiary_wallet,
+                    invite_code: row.invite_code.clone(),
+                    beneficiary_wallet: row.beneficiary_wallet.clone(),
+                    chain_id: row.chain_id,
+                    payment_token: row.payment_token.clone(),
+                    payment_token_decimals,
                     confirmed_order_count: 0,
                     paid_amount_total: U256::zero(),
                     commission_base_amount_total: U256::zero(),
                     commission_amount_total: U256::zero(),
-                }
-            });
+                });
 
             let commission_base_amount = U256::from_dec_str(&row.commission_base_amount)?;
             let mut commission_amount = U256::from_dec_str(&row.commission_amount)?;
@@ -1982,7 +1998,12 @@ ExpiresAt: {expires_at}"
             .into_values()
             .map(ReferralSettlementAccumulator::into_row)
             .collect::<Vec<_>>();
-        output.sort_by(|a, b| a.invite_code.cmp(&b.invite_code));
+        output.sort_by(|a, b| {
+            a.invite_code
+                .cmp(&b.invite_code)
+                .then_with(|| a.chain_id.cmp(&b.chain_id))
+                .then_with(|| a.payment_token.cmp(&b.payment_token))
+        });
         Ok(output)
     }
 

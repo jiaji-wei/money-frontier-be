@@ -836,14 +836,19 @@ pub async fn download_referral_settlements_csv(
         })?;
 
     let mut csv = String::from(
-        "invite_code_id,invite_code,beneficiary_wallet,confirmed_order_count,paid_amount_total,commission_base_amount_total,commission_amount_total\n",
+        "invite_code_id,invite_code,beneficiary_wallet,chain_id,payment_token,payment_token_decimals,confirmed_order_count,paid_amount_total,commission_base_amount_total,commission_amount_total\n",
     );
     for row in rows {
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{}\n",
             row.invite_code_id,
             csv_escape(&row.invite_code),
             csv_escape(row.beneficiary_wallet.as_deref().unwrap_or("")),
+            row.chain_id,
+            csv_escape(&row.payment_token),
+            row.payment_token_decimals
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
             row.confirmed_order_count,
             row.paid_amount_total,
             row.commission_base_amount_total,
@@ -2799,6 +2804,98 @@ mod tests {
             body["items"][0]["commission_amount_total"],
             "8000000000000000000"
         );
+    }
+
+    #[tokio::test]
+    async fn admin_settlement_keeps_chains_separate_for_same_invite_code() {
+        let finance_wallet = "0x1111111111111111111111111111111111111111";
+        let customer_wallet = "0x3333333333333333333333333333333333333333";
+        let (app, state) = build_test_app(vec![admin_config(finance_wallet, "finance")]).await;
+        let finance_token = admin_token(&state, finance_wallet, "finance");
+        let referral_id = state
+            .db
+            .seed_referral_code("MULTICHAIN")
+            .await
+            .expect("referral seed should succeed");
+
+        let eth_order_id = state
+            .db
+            .seed_order(
+                1,
+                "0xethsettle",
+                1,
+                "eth-settle-order",
+                customer_wallet,
+                "79200000",
+            )
+            .await
+            .expect("eth order seed should succeed");
+        state
+            .db
+            .insert_order_promotions_snapshot(NewOrderPromotionsSnapshot {
+                order_row_id: eth_order_id,
+                wallet_address: customer_wallet.to_string(),
+                referral_code_id: Some(referral_id),
+                discount_code_id: None,
+                original_total_amount: "88000000".to_string(),
+                discount_amount: "8800000".to_string(),
+                paid_amount: "79200000".to_string(),
+                commission_base_amount: "79200000".to_string(),
+                commission_amount: "7920000".to_string(),
+                rule_version: "v1".to_string(),
+                created_at: 1,
+            })
+            .await
+            .expect("eth snapshot seed should succeed");
+
+        let bsc_order_id = state
+            .db
+            .seed_order(
+                56,
+                "0xbscsettle",
+                1,
+                "bsc-settle-order",
+                customer_wallet,
+                "79200000000000000000",
+            )
+            .await
+            .expect("bsc order seed should succeed");
+        state
+            .db
+            .insert_order_promotions_snapshot(NewOrderPromotionsSnapshot {
+                order_row_id: bsc_order_id,
+                wallet_address: customer_wallet.to_string(),
+                referral_code_id: Some(referral_id),
+                discount_code_id: None,
+                original_total_amount: "88000000000000000000".to_string(),
+                discount_amount: "8800000000000000000".to_string(),
+                paid_amount: "79200000000000000000".to_string(),
+                commission_base_amount: "79200000000000000000".to_string(),
+                commission_amount: "7920000000000000000".to_string(),
+                rule_version: "v1".to_string(),
+                created_at: 1,
+            })
+            .await
+            .expect("bsc snapshot seed should succeed");
+
+        let (status, body) = json_request(
+            &app,
+            Method::GET,
+            "/settlements/referrals",
+            Some(&finance_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let items = body["items"].as_array().expect("items should be an array");
+        assert_eq!(items.len(), 2);
+        assert!(items
+            .iter()
+            .any(|item| item["chain_id"] == 1 && item["paid_amount_total"] == "79200000"));
+        assert!(items
+            .iter()
+            .any(|item| item["chain_id"] == 56
+                && item["paid_amount_total"] == "79200000000000000000"));
     }
 
     #[tokio::test]
