@@ -10,6 +10,7 @@ mod indexer;
 mod mailer;
 mod promotions;
 mod routes;
+mod stripe;
 
 use std::sync::Arc;
 
@@ -60,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
         config.mail_retry_backoff_ms,
         config.mail_alert_webhook_url.clone(),
         config.mail_alert_api_key.clone(),
-    )?;
+    )?
+    .with_reply_to(config.mail_reply_to.clone());
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -78,6 +80,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(routes::health))
         .route("/signin/challenge", post(routes::signin_challenge))
         .route("/signin", post(routes::signin_verify))
+        .route(
+            "/email/access/challenge",
+            post(routes::email_access_challenge),
+        )
+        .route("/email/access/verify", post(routes::email_access_verify))
+        .route(
+            "/fiat/checkout-sessions",
+            post(routes::create_fiat_checkout_session),
+        )
+        .route("/stripe/webhook", post(routes::stripe_webhook))
         .route("/purchase-prices", post(routes::list_ticket_prices))
         .route("/purchase-quotes", post(routes::create_purchase_quote))
         .route("/purchase-intents", post(routes::create_purchase_intent))

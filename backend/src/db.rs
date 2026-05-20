@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use ethers_core::types::U256;
+use ethers_core::{
+    types::{H256, U256},
+    utils::keccak256,
+};
 use serde::Serialize;
 use sqlx::{sqlite::SqlitePoolOptions, FromRow, QueryBuilder, SqlitePool};
 use uuid::Uuid;
@@ -250,6 +253,22 @@ pub struct SigninChallenge {
 }
 
 #[derive(Debug, Clone)]
+pub struct EmailAccessChallenge {
+    pub id: String,
+    pub email: String,
+    pub token: String,
+    pub token_hash: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ConsumedEmailAccessChallenge {
+    pub id: String,
+    pub email: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewAdminAuditLog {
     pub actor_wallet: String,
     pub actor_role: String,
@@ -305,6 +324,52 @@ pub struct NewDiscountCode {
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewFiatCheckoutSession {
+    pub id: String,
+    pub email: String,
+    pub currency: String,
+    pub level_ids_json: String,
+    pub quantities_json: String,
+    pub unit_prices_cents_json: String,
+    pub referral_code_id: Option<i64>,
+    pub discount_code_id: Option<i64>,
+    pub original_amount_cents: i64,
+    pub discount_amount_cents: i64,
+    pub final_amount_cents: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct FiatCheckoutSessionRow {
+    pub id: String,
+    pub stripe_session_id: Option<String>,
+    pub email: String,
+    pub currency: String,
+    pub level_ids_json: String,
+    pub quantities_json: String,
+    pub unit_prices_cents_json: String,
+    pub referral_code_id: Option<i64>,
+    pub discount_code_id: Option<i64>,
+    pub original_amount_cents: i64,
+    pub discount_amount_cents: i64,
+    pub final_amount_cents: i64,
+    pub status: String,
+    pub stripe_url: Option<String>,
+    pub payment_intent_id: Option<String>,
+    pub internal_order_row_id: Option<i64>,
+    pub created_tickets: i64,
+    pub expires_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FiatCheckoutConfirmation {
+    pub checkout: FiatCheckoutSessionRow,
+    pub newly_paid: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +523,364 @@ ExpiresAt: {expires_at}"
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    pub async fn create_email_access_challenge(
+        &self,
+        email: &str,
+        ttl_secs: i64,
+    ) -> anyhow::Result<EmailAccessChallenge> {
+        let id = Uuid::new_v4().to_string();
+        let token = Uuid::new_v4().simple().to_string();
+        let token_hash = email_access_token_hash(&token);
+        let now_ts = unix_now();
+        let expires_at = now_ts + ttl_secs;
+
+        sqlx::query(
+            r#"
+            INSERT INTO email_access_challenges (id, email, token_hash, expires_at, used_at, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5)
+            "#,
+        )
+        .bind(&id)
+        .bind(email)
+        .bind(&token_hash)
+        .bind(expires_at)
+        .bind(now_ts)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(EmailAccessChallenge {
+            id,
+            email: email.to_string(),
+            token,
+            token_hash,
+            expires_at,
+        })
+    }
+
+    pub async fn consume_email_access_challenge(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<ConsumedEmailAccessChallenge>> {
+        let token_hash = email_access_token_hash(token);
+        let now_ts = unix_now();
+        let mut tx = self.pool.begin().await?;
+
+        let row = sqlx::query_as::<_, ConsumedEmailAccessChallenge>(
+            r#"
+            SELECT id, email, expires_at
+            FROM email_access_challenges
+            WHERE token_hash = ?1
+              AND used_at IS NULL
+              AND expires_at >= ?2
+            "#,
+        )
+        .bind(&token_hash)
+        .bind(now_ts)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        let update = sqlx::query(
+            r#"
+            UPDATE email_access_challenges
+            SET used_at = ?2,
+                updated_at = ?2
+            WHERE id = ?1
+              AND used_at IS NULL
+              AND expires_at >= ?2
+            "#,
+        )
+        .bind(&row.id)
+        .bind(now_ts)
+        .execute(&mut *tx)
+        .await?;
+
+        if update.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        tx.commit().await?;
+        Ok(Some(row))
+    }
+
+    pub async fn create_fiat_checkout_session(
+        &self,
+        input: NewFiatCheckoutSession,
+    ) -> anyhow::Result<FiatCheckoutSessionRow> {
+        let now_ts = unix_now();
+        sqlx::query(
+            r#"
+            INSERT INTO fiat_checkout_sessions (
+                id,
+                stripe_session_id,
+                email,
+                currency,
+                level_ids_json,
+                quantities_json,
+                unit_prices_cents_json,
+                referral_code_id,
+                discount_code_id,
+                original_amount_cents,
+                discount_amount_cents,
+                final_amount_cents,
+                status,
+                stripe_url,
+                payment_intent_id,
+                internal_order_row_id,
+                created_tickets,
+                expires_at,
+                created_at,
+                updated_at
+            ) VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', NULL, NULL, NULL, 0, ?12, ?13, ?13)
+            "#,
+        )
+        .bind(&input.id)
+        .bind(input.email)
+        .bind(input.currency)
+        .bind(input.level_ids_json)
+        .bind(input.quantities_json)
+        .bind(input.unit_prices_cents_json)
+        .bind(input.referral_code_id)
+        .bind(input.discount_code_id)
+        .bind(input.original_amount_cents)
+        .bind(input.discount_amount_cents)
+        .bind(input.final_amount_cents)
+        .bind(input.expires_at)
+        .bind(now_ts)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_fiat_checkout_session(&input.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fiat checkout session should exist after insert"))
+    }
+
+    pub async fn attach_stripe_checkout_session(
+        &self,
+        id: &str,
+        stripe_session_id: &str,
+        stripe_url: &str,
+    ) -> anyhow::Result<Option<FiatCheckoutSessionRow>> {
+        let now_ts = unix_now();
+        sqlx::query(
+            r#"
+            UPDATE fiat_checkout_sessions
+            SET stripe_session_id = ?2,
+                stripe_url = ?3,
+                updated_at = ?4
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .bind(stripe_session_id)
+        .bind(stripe_url)
+        .bind(now_ts)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_fiat_checkout_session(id).await
+    }
+
+    pub async fn get_fiat_checkout_session(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<FiatCheckoutSessionRow>> {
+        let row = sqlx::query_as::<_, FiatCheckoutSessionRow>(
+            r#"
+            SELECT id, stripe_session_id, email, currency, level_ids_json, quantities_json,
+                   unit_prices_cents_json,
+                   referral_code_id, discount_code_id, original_amount_cents,
+                   discount_amount_cents, final_amount_cents, status, stripe_url,
+                   payment_intent_id, internal_order_row_id, created_tickets,
+                   expires_at, created_at, updated_at
+            FROM fiat_checkout_sessions
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn get_fiat_checkout_session_by_stripe_id(
+        &self,
+        stripe_session_id: &str,
+    ) -> anyhow::Result<Option<FiatCheckoutSessionRow>> {
+        let row = sqlx::query_as::<_, FiatCheckoutSessionRow>(
+            r#"
+            SELECT id, stripe_session_id, email, currency, level_ids_json, quantities_json,
+                   unit_prices_cents_json,
+                   referral_code_id, discount_code_id, original_amount_cents,
+                   discount_amount_cents, final_amount_cents, status, stripe_url,
+                   payment_intent_id, internal_order_row_id, created_tickets,
+                   expires_at, created_at, updated_at
+            FROM fiat_checkout_sessions
+            WHERE stripe_session_id = ?1
+            "#,
+        )
+        .bind(stripe_session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn confirm_fiat_checkout_session(
+        &self,
+        stripe_session_id: &str,
+        payment_intent_id: Option<&str>,
+    ) -> anyhow::Result<Option<FiatCheckoutConfirmation>> {
+        let mut tx = self.pool.begin().await?;
+        let now_ts = unix_now();
+
+        let checkout = sqlx::query_as::<_, FiatCheckoutSessionRow>(
+            r#"
+            SELECT id, stripe_session_id, email, currency, level_ids_json, quantities_json,
+                   unit_prices_cents_json,
+                   referral_code_id, discount_code_id, original_amount_cents,
+                   discount_amount_cents, final_amount_cents, status, stripe_url,
+                   payment_intent_id, internal_order_row_id, created_tickets,
+                   expires_at, created_at, updated_at
+            FROM fiat_checkout_sessions
+            WHERE stripe_session_id = ?1
+            "#,
+        )
+        .bind(stripe_session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(checkout) = checkout else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        if checkout.status == "paid" {
+            tx.rollback().await?;
+            return Ok(Some(FiatCheckoutConfirmation {
+                checkout,
+                newly_paid: false,
+            }));
+        }
+
+        let order_id = format!("fiat:{}", checkout.id);
+        let tx_hash = format!("stripe:{stripe_session_id}");
+        let order_insert = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO orders (
+                chain_id,
+                tx_hash,
+                log_index,
+                block_number,
+                block_hash,
+                order_id,
+                buyer_address,
+                payment_token,
+                total_amount,
+                created_at
+            ) VALUES (0, ?1, 0, 0, 'stripe', ?2, ?3, ?4, ?5, ?6)
+            "#,
+        )
+        .bind(&tx_hash)
+        .bind(&order_id)
+        .bind(&checkout.email)
+        .bind(format!("stripe:{}", checkout.currency))
+        .bind(checkout.final_amount_cents.to_string())
+        .bind(now_ts)
+        .execute(&mut *tx)
+        .await?;
+
+        let order_row_id: i64 = sqlx::query_scalar("SELECT id FROM orders WHERE tx_hash = ?1")
+            .bind(&tx_hash)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let mut created_tickets = 0i64;
+        if order_insert.rows_affected() == 1 {
+            let level_ids: Vec<i64> = serde_json::from_str(&checkout.level_ids_json)?;
+            let quantities: Vec<i64> = serde_json::from_str(&checkout.quantities_json)?;
+            let unit_prices: Vec<i64> = serde_json::from_str(&checkout.unit_prices_cents_json)?;
+            for ((index, level), quantity) in level_ids.into_iter().enumerate().zip(quantities) {
+                let unit_price = unit_prices
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(|| fallback_fiat_unit_price(&checkout, quantity));
+                for _ in 0..quantity {
+                    let ticket_id = Uuid::new_v4().to_string();
+                    let qr_payload = format!(
+                        "money-frontier:qr:{}:1:{}",
+                        ticket_id,
+                        Uuid::new_v4().simple()
+                    );
+                    sqlx::query(
+                        r#"
+                        INSERT INTO tickets (
+                            id,
+                            chain_id,
+                            order_id,
+                            source_order_row_id,
+                            owner_wallet,
+                            owner_email,
+                            ticket_level,
+                            unit_price,
+                            qr_payload,
+                            qr_version,
+                            status,
+                            created_at,
+                            updated_at
+                        ) VALUES (?1, 0, ?2, ?3, NULL, ?4, ?5, ?6, ?7, 1, 'active', ?8, ?8)
+                        "#,
+                    )
+                    .bind(&ticket_id)
+                    .bind(&order_id)
+                    .bind(order_row_id)
+                    .bind(&checkout.email)
+                    .bind(level)
+                    .bind(unit_price.to_string())
+                    .bind(qr_payload)
+                    .bind(now_ts)
+                    .execute(&mut *tx)
+                    .await?;
+                    created_tickets += 1;
+                }
+            }
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE fiat_checkout_sessions
+            SET status = 'paid',
+                payment_intent_id = ?2,
+                internal_order_row_id = ?3,
+                created_tickets = CASE WHEN created_tickets > 0 THEN created_tickets ELSE ?4 END,
+                updated_at = ?5
+            WHERE id = ?1
+            "#,
+        )
+        .bind(&checkout.id)
+        .bind(payment_intent_id)
+        .bind(order_row_id)
+        .bind(created_tickets)
+        .bind(now_ts)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(self
+            .get_fiat_checkout_session(&checkout.id)
+            .await?
+            .map(|checkout| FiatCheckoutConfirmation {
+                checkout,
+                newly_paid: created_tickets > 0,
+            }))
     }
 
     pub async fn create_admin_signin_challenge(
@@ -2198,6 +2621,25 @@ ExpiresAt: {expires_at}"
         Ok(rows)
     }
 
+    pub async fn list_active_tickets_by_email(
+        &self,
+        email: &str,
+    ) -> anyhow::Result<Vec<TicketRow>> {
+        let rows = sqlx::query_as::<_, TicketRow>(
+            r#"
+            SELECT id, chain_id, order_id, owner_wallet, owner_email, ticket_level, unit_price, qr_payload, qr_version, status, created_at, updated_at
+            FROM tickets
+            WHERE owner_email = ?1 AND status = 'active'
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(email)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     pub async fn get_active_ticket_by_id_for_wallet(
         &self,
         ticket_id: &str,
@@ -2212,6 +2654,26 @@ ExpiresAt: {expires_at}"
         )
         .bind(ticket_id)
         .bind(wallet)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn get_active_ticket_by_id_for_email(
+        &self,
+        ticket_id: &str,
+        email: &str,
+    ) -> anyhow::Result<Option<TicketRow>> {
+        let row = sqlx::query_as::<_, TicketRow>(
+            r#"
+            SELECT id, chain_id, order_id, owner_wallet, owner_email, ticket_level, unit_price, qr_payload, qr_version, status, created_at, updated_at
+            FROM tickets
+            WHERE id = ?1 AND owner_email = ?2 AND status = 'active'
+            "#,
+        )
+        .bind(ticket_id)
+        .bind(email)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -2942,6 +3404,13 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+fn fallback_fiat_unit_price(checkout: &FiatCheckoutSessionRow, quantity: i64) -> i64 {
+    if quantity <= 0 {
+        return 0;
+    }
+    checkout.original_amount_cents / quantity
+}
+
 async fn calculate_referral_commission_amount(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     referral_code_id: Option<i64>,
@@ -3052,6 +3521,10 @@ fn parse_human_token_amount(value: &str, decimals: Option<u8>) -> anyhow::Result
     }
 
     Ok(amount)
+}
+
+fn email_access_token_hash(token: &str) -> String {
+    format!("{:#x}", H256::from(keccak256(token.as_bytes())))
 }
 
 #[cfg(test)]
@@ -3176,6 +3649,72 @@ mod tests {
             .expect("transfer should succeed")
             .expect("ticket should transfer");
         assert!(transferred.qr_payload.starts_with("money-frontier:qr:"));
+    }
+
+    #[tokio::test]
+    async fn email_access_challenge_is_one_time_and_lists_email_tickets() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("db should initialize");
+        let buyer = "0x1111111111111111111111111111111111111111";
+        let email = "guest@example.com";
+
+        db.index_purchase(
+            56,
+            &DecodedPurchase {
+                tx_hash: "0xbbbb".to_string(),
+                log_index: 0,
+                block_number: 101,
+                block_hash: Some("0xblock".to_string()),
+                order_id: "2".to_string(),
+                buyer: buyer.to_string(),
+                payment_token: "0x2222222222222222222222222222222222222222".to_string(),
+                total_amount: "1000000000000000000".to_string(),
+                level_ids: vec![1],
+                quantities: vec![1],
+                unit_prices: vec!["1000000000000000000".to_string()],
+                intent_id: None,
+            },
+        )
+        .await
+        .expect("purchase should index");
+
+        let wallet_tickets = db
+            .list_active_tickets_by_wallet(buyer)
+            .await
+            .expect("wallet tickets should load");
+
+        db.transfer_ticket(&wallet_tickets[0].id, buyer, None, Some(email))
+            .await
+            .expect("ticket should transfer to email")
+            .expect("ticket should exist");
+
+        let email_tickets = db
+            .list_active_tickets_by_email(email)
+            .await
+            .expect("email tickets should load");
+        assert_eq!(email_tickets.len(), 1);
+        assert_eq!(email_tickets[0].owner_email.as_deref(), Some(email));
+
+        let challenge = db
+            .create_email_access_challenge(email, 900)
+            .await
+            .expect("email access challenge should be created");
+        assert_ne!(challenge.token, challenge.token_hash);
+        assert_eq!(challenge.email, email);
+
+        let consumed = db
+            .consume_email_access_challenge(&challenge.token)
+            .await
+            .expect("email access challenge should consume")
+            .expect("email access challenge should exist");
+        assert_eq!(consumed.email, email);
+
+        let consumed_again = db
+            .consume_email_access_challenge(&challenge.token)
+            .await
+            .expect("consuming twice should not error");
+        assert!(consumed_again.is_none());
     }
 
     #[tokio::test]
