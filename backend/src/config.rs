@@ -63,6 +63,30 @@ fn default_mail_retry_backoff_ms() -> u64 {
     300
 }
 
+fn default_email_access_token_ttl_secs() -> i64 {
+    900
+}
+
+fn default_email_session_ttl_hours() -> i64 {
+    24
+}
+
+fn default_stripe_api_version() -> String {
+    "2026-04-22.dahlia".to_string()
+}
+
+fn default_stripe_currency() -> String {
+    "usd".to_string()
+}
+
+fn default_stripe_api_base_url() -> String {
+    "https://api.stripe.com".to_string()
+}
+
+fn default_fiat_checkout_session_ttl_secs() -> i64 {
+    1800
+}
+
 fn default_signin_cleanup_interval_secs() -> u64 {
     600
 }
@@ -110,6 +134,7 @@ pub struct AppConfig {
     pub jwt_secret: String,
     pub jwt_ttl_days: i64,
     pub mail_from: String,
+    pub mail_reply_to: Option<String>,
     pub mail_provider: String,
     pub mail_webhook_url: Option<String>,
     pub mail_api_key: Option<String>,
@@ -117,6 +142,20 @@ pub struct AppConfig {
     pub mail_retry_backoff_ms: u64,
     pub mail_alert_webhook_url: Option<String>,
     pub mail_alert_api_key: Option<String>,
+    pub app_public_base_url: String,
+    pub email_access_token_ttl_secs: i64,
+    pub email_session_ttl_hours: i64,
+    pub stripe_enabled: bool,
+    pub stripe_api_key: Option<String>,
+    pub stripe_webhook_secret: Option<String>,
+    pub stripe_api_version: String,
+    pub stripe_currency: String,
+    pub stripe_success_url: String,
+    pub stripe_cancel_url: String,
+    pub stripe_api_base_url: String,
+    pub fiat_price_chain_id: u64,
+    pub fiat_price_payment_token: String,
+    pub fiat_checkout_session_ttl_secs: i64,
     pub chains: Vec<ChainConfig>,
     pub indexer_poll_interval_secs: u64,
     pub indexer_batch_size: u64,
@@ -147,6 +186,7 @@ impl AppConfig {
 
         let mail_from =
             env::var("MAIL_FROM").unwrap_or_else(|_| "noreply@tickets.local".to_string());
+        let mail_reply_to = env::var("MAIL_REPLY_TO").ok();
         let mail_provider = env::var("MAIL_PROVIDER").unwrap_or_else(|_| "console".to_string());
         let mail_webhook_url = env::var("MAIL_WEBHOOK_URL").ok();
         let mail_api_key = env::var("MAIL_API_KEY").ok();
@@ -160,6 +200,43 @@ impl AppConfig {
             .unwrap_or_else(default_mail_retry_backoff_ms);
         let mail_alert_webhook_url = env::var("MAIL_ALERT_WEBHOOK_URL").ok();
         let mail_alert_api_key = env::var("MAIL_ALERT_API_KEY").ok();
+        let app_public_base_url =
+            env::var("APP_PUBLIC_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let email_access_token_ttl_secs = env::var("EMAIL_ACCESS_TOKEN_TTL_SECS")
+            .ok()
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or_else(default_email_access_token_ttl_secs);
+        let email_session_ttl_hours = env::var("EMAIL_SESSION_TTL_HOURS")
+            .ok()
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or_else(default_email_session_ttl_hours);
+        let stripe_enabled = env::var("STRIPE_ENABLED")
+            .ok()
+            .is_some_and(|raw| matches!(raw.as_str(), "true" | "1" | "yes"));
+        let stripe_api_key = env::var("STRIPE_API_KEY").ok();
+        let stripe_webhook_secret = env::var("STRIPE_WEBHOOK_SECRET").ok();
+        let stripe_api_version =
+            env::var("STRIPE_API_VERSION").unwrap_or_else(|_| default_stripe_api_version());
+        let stripe_currency =
+            env::var("STRIPE_CURRENCY").unwrap_or_else(|_| default_stripe_currency());
+        let stripe_success_url = env::var("STRIPE_SUCCESS_URL").unwrap_or_else(|_| {
+            "http://127.0.0.1:3000/en/tickets/checkout/success?session_id={CHECKOUT_SESSION_ID}"
+                .to_string()
+        });
+        let stripe_cancel_url = env::var("STRIPE_CANCEL_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3000/en/tickets/checkout/cancelled".to_string());
+        let stripe_api_base_url =
+            env::var("STRIPE_API_BASE_URL").unwrap_or_else(|_| default_stripe_api_base_url());
+        let fiat_price_chain_id = env::var("FIAT_PRICE_CHAIN_ID")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(56);
+        let fiat_price_payment_token = env::var("FIAT_PRICE_PAYMENT_TOKEN")
+            .unwrap_or_else(|_| "0x55d398326f99059ff775485246999027b3197955".to_string());
+        let fiat_checkout_session_ttl_secs = env::var("FIAT_CHECKOUT_SESSION_TTL_SECS")
+            .ok()
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or_else(default_fiat_checkout_session_ttl_secs);
 
         let chains_json = env::var("APP_CHAINS_JSON").unwrap_or_else(|_| "[]".to_string());
         let chains: Vec<ChainConfig> = serde_json::from_str(&chains_json)?;
@@ -207,6 +284,7 @@ impl AppConfig {
             jwt_secret,
             jwt_ttl_days,
             mail_from,
+            mail_reply_to,
             mail_provider,
             mail_webhook_url,
             mail_api_key,
@@ -214,6 +292,20 @@ impl AppConfig {
             mail_retry_backoff_ms,
             mail_alert_webhook_url,
             mail_alert_api_key,
+            app_public_base_url,
+            email_access_token_ttl_secs,
+            email_session_ttl_hours,
+            stripe_enabled,
+            stripe_api_key,
+            stripe_webhook_secret,
+            stripe_api_version,
+            stripe_currency,
+            stripe_success_url,
+            stripe_cancel_url,
+            stripe_api_base_url,
+            fiat_price_chain_id,
+            fiat_price_payment_token,
+            fiat_checkout_session_ttl_secs,
             chains,
             indexer_poll_interval_secs,
             indexer_batch_size,

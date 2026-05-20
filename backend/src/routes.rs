@@ -1,17 +1,22 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{Path, State},
     http::HeaderMap,
     Json,
 };
 use ethers_core::types::U256;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::stripe::{CreateCheckoutSession, StripeCheckoutLineItem};
 use crate::{
-    auth::{extract_wallet, normalize_wallet_address, verify_wallet_signature},
+    auth::{
+        extract_email_session, extract_wallet, normalize_wallet_address, verify_wallet_signature,
+    },
     config::{payment_token_decimals, ChainConfig},
-    db::TicketRow,
+    db::{FiatCheckoutSessionRow, NewFiatCheckoutSession, TicketRow},
     error::ApiError,
     promotions::{
         normalize_promotion_code, sign_purchase_authorization, DiscountRedemptionStatus,
@@ -74,6 +79,49 @@ pub struct SigninResponse {
     pub token: String,
     pub expires_at: i64,
     pub referral_binding: Option<ReferralBindingStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmailAccessChallengeRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmailAccessChallengeResponse {
+    pub email: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmailAccessVerifyRequest {
+    pub token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmailAccessVerifyResponse {
+    pub email: String,
+    pub token: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateFiatCheckoutSessionRequest {
+    pub email: String,
+    pub level_ids: Vec<u8>,
+    pub quantities: Vec<u64>,
+    pub discount_code: Option<String>,
+    pub referral_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateFiatCheckoutSessionResponse {
+    pub checkout_id: String,
+    pub stripe_session_id: String,
+    pub url: String,
+    pub original_amount_cents: i64,
+    pub discount_amount_cents: i64,
+    pub final_amount_cents: i64,
+    pub currency: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +288,400 @@ pub async fn signin_verify(
         expires_at,
         referral_binding,
     }))
+}
+
+pub async fn email_access_challenge(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EmailAccessChallengeRequest>,
+) -> Result<Json<EmailAccessChallengeResponse>, ApiError> {
+    let email = normalize_email_checked(&req.email)?;
+    let challenge = state
+        .db
+        .create_email_access_challenge(&email, state.config.email_access_token_ttl_secs)
+        .await
+        .map_err(|err| {
+            ApiError::internal(format!("create email access challenge failed: {err}"))
+        })?;
+
+    let access_url = build_email_access_url(&state.config.app_public_base_url, &challenge.token);
+    state
+        .mailer
+        .send_ticket_access_link(
+            &email,
+            &access_url,
+            state.config.email_access_token_ttl_secs,
+        )
+        .await
+        .map_err(|err| ApiError::internal(format!("email access dispatch failed: {err}")))?;
+
+    Ok(Json(EmailAccessChallengeResponse {
+        email,
+        expires_at: challenge.expires_at,
+    }))
+}
+
+pub async fn email_access_verify(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EmailAccessVerifyRequest>,
+) -> Result<Json<EmailAccessVerifyResponse>, ApiError> {
+    let consumed = state
+        .db
+        .consume_email_access_challenge(&req.token)
+        .await
+        .map_err(|err| ApiError::internal(format!("consume email access challenge failed: {err}")))?
+        .ok_or_else(|| ApiError::unauthorized("invalid or expired email access token"))?;
+
+    let (token, expires_at) = state
+        .jwt
+        .issue_email_session(&consumed.email, state.config.email_session_ttl_hours)?;
+
+    Ok(Json(EmailAccessVerifyResponse {
+        email: consumed.email,
+        token,
+        expires_at,
+    }))
+}
+
+pub async fn create_fiat_checkout_session(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateFiatCheckoutSessionRequest>,
+) -> Result<Json<CreateFiatCheckoutSessionResponse>, ApiError> {
+    if !state.config.stripe_enabled {
+        return Err(ApiError::bad_request("stripe checkout is disabled"));
+    }
+    validate_purchase_items(&req.level_ids, &req.quantities)?;
+    let email = normalize_email_checked(&req.email)?;
+    let api_key = state
+        .config
+        .stripe_api_key
+        .clone()
+        .ok_or_else(|| ApiError::internal("stripe api key is not configured"))?;
+    let payment_token = normalize_wallet_address(&state.config.fiat_price_payment_token)?;
+
+    let quote = state
+        .chain
+        .quote_purchase(
+            state.config.fiat_price_chain_id,
+            &req.level_ids,
+            &req.quantities,
+        )
+        .await
+        .map_err(|err| ApiError::bad_request(format!("failed to quote purchase: {err}")))?;
+    let original_total = parse_u256_decimal(&quote.total_amount)?;
+
+    let referral_code_id = resolve_fiat_referral(&state, req.referral_code.as_deref()).await?;
+    let discount_code_present = req
+        .discount_code
+        .as_deref()
+        .and_then(normalize_promotion_code)
+        .is_some();
+    let (discount_code_id, discount_amount) = if discount_code_present {
+        resolve_discount(
+            &state,
+            &email,
+            state.config.fiat_price_chain_id,
+            &payment_token,
+            &req.level_ids,
+            req.discount_code.as_deref(),
+            referral_code_id.is_some(),
+            original_total,
+            DiscountResolutionMode::Preview,
+        )
+        .await?
+    } else {
+        (
+            None,
+            resolve_referral_auto_discount(
+                &state,
+                state.config.fiat_price_chain_id,
+                &payment_token,
+                referral_code_id,
+                original_total,
+            )
+            .await?,
+        )
+    };
+    let final_total = original_total.saturating_sub(discount_amount);
+    let decimals = payment_token_decimals(state.config.fiat_price_chain_id, &payment_token)
+        .ok_or_else(|| ApiError::bad_request("payment token decimals are not configured"))?;
+    let original_amount_cents = token_amount_to_cents(original_total, decimals)?;
+    let discount_amount_cents = token_amount_to_cents(discount_amount, decimals)?;
+    let final_amount_cents = token_amount_to_cents(final_total, decimals)?;
+    let unit_prices_cents = token_unit_prices_to_cents(&quote.unit_prices, decimals)?;
+    if final_amount_cents <= 0 {
+        return Err(ApiError::bad_request("checkout amount must be positive"));
+    }
+
+    let checkout_id = uuid::Uuid::new_v4().to_string();
+    let expires_at = unix_now() + state.config.fiat_checkout_session_ttl_secs;
+    let checkout = state
+        .db
+        .create_fiat_checkout_session(NewFiatCheckoutSession {
+            id: checkout_id.clone(),
+            email: email.clone(),
+            currency: state.config.stripe_currency.clone(),
+            level_ids_json: serde_json::to_string(&req.level_ids)
+                .map_err(|err| ApiError::internal(format!("serialize levels failed: {err}")))?,
+            quantities_json: serde_json::to_string(&req.quantities)
+                .map_err(|err| ApiError::internal(format!("serialize quantities failed: {err}")))?,
+            unit_prices_cents_json: serde_json::to_string(&unit_prices_cents).map_err(|err| {
+                ApiError::internal(format!("serialize unit prices failed: {err}"))
+            })?,
+            referral_code_id,
+            discount_code_id,
+            original_amount_cents,
+            discount_amount_cents,
+            final_amount_cents,
+            expires_at,
+        })
+        .await
+        .map_err(|err| ApiError::internal(format!("create fiat checkout failed: {err}")))?;
+
+    let line_items = build_stripe_line_items(
+        &req.level_ids,
+        &req.quantities,
+        &quote.unit_prices,
+        decimals,
+        final_amount_cents,
+        discount_amount_cents,
+    )?;
+    let stripe_client = crate::stripe::StripeClient::new(
+        api_key,
+        state.config.stripe_api_version.clone(),
+        state.config.stripe_api_base_url.clone(),
+    );
+    let stripe_session = stripe_client
+        .create_checkout_session(&CreateCheckoutSession {
+            success_url: state.config.stripe_success_url.clone(),
+            cancel_url: state.config.stripe_cancel_url.clone(),
+            currency: state.config.stripe_currency.clone(),
+            customer_email: email.clone(),
+            client_reference_id: checkout.id.clone(),
+            metadata: vec![("fiat_checkout_id".to_string(), checkout.id.clone())],
+            line_items,
+            expires_at,
+        })
+        .await
+        .map_err(|err| ApiError::internal(format!("create stripe checkout failed: {err}")))?;
+
+    let checkout = state
+        .db
+        .attach_stripe_checkout_session(&checkout.id, &stripe_session.id, &stripe_session.url)
+        .await
+        .map_err(|err| ApiError::internal(format!("attach stripe checkout failed: {err}")))?
+        .ok_or_else(|| ApiError::internal("fiat checkout disappeared"))?;
+
+    Ok(Json(CreateFiatCheckoutSessionResponse {
+        checkout_id: checkout.id,
+        stripe_session_id: stripe_session.id,
+        url: stripe_session.url,
+        original_amount_cents,
+        discount_amount_cents,
+        final_amount_cents,
+        currency: state.config.stripe_currency.clone(),
+    }))
+}
+
+pub async fn stripe_webhook(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let secret = state
+        .config
+        .stripe_webhook_secret
+        .as_deref()
+        .ok_or_else(|| ApiError::internal("stripe webhook secret is not configured"))?;
+    let signature = headers
+        .get("stripe-signature")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::bad_request("missing stripe signature"))?;
+    crate::stripe::verify_webhook_signature(&body, signature, secret, 300, unix_now())
+        .map_err(|_| ApiError::bad_request("invalid stripe signature"))?;
+
+    let event: Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("invalid stripe webhook payload"))?;
+    let event_type = event["type"].as_str().unwrap_or_default();
+    if !matches!(
+        event_type,
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded"
+    ) {
+        return Ok(Json(serde_json::json!({ "received": true })));
+    }
+    let session = &event["data"]["object"];
+    if session["payment_status"].as_str() != Some("paid") {
+        return Ok(Json(serde_json::json!({ "received": true })));
+    }
+    let stripe_session_id = session["id"]
+        .as_str()
+        .ok_or_else(|| ApiError::bad_request("missing stripe session id"))?;
+    let payment_intent_id = session["payment_intent"].as_str();
+    let checkout = state
+        .db
+        .get_fiat_checkout_session_by_stripe_id(stripe_session_id)
+        .await
+        .map_err(|err| ApiError::internal(format!("load fiat checkout failed: {err}")))?;
+    let Some(checkout) = checkout else {
+        if session["metadata"]["fiat_checkout_id"].as_str().is_none() {
+            return Ok(Json(serde_json::json!({ "received": true })));
+        }
+        return Err(ApiError::bad_request("unknown stripe checkout session"));
+    };
+    validate_stripe_checkout_session(session, &checkout)?;
+
+    let confirmation = state
+        .db
+        .confirm_fiat_checkout_session(stripe_session_id, payment_intent_id)
+        .await
+        .map_err(|err| ApiError::internal(format!("confirm fiat checkout failed: {err}")))?
+        .ok_or_else(|| ApiError::bad_request("unknown stripe checkout session"))?;
+    let checkout = confirmation.checkout;
+
+    if confirmation.newly_paid && checkout.created_tickets > 0 {
+        let challenge = state
+            .db
+            .create_email_access_challenge(
+                &checkout.email,
+                state.config.email_access_token_ttl_secs,
+            )
+            .await
+            .map_err(|err| {
+                ApiError::internal(format!("create email access challenge failed: {err}"))
+            })?;
+        let access_url =
+            build_email_access_url(&state.config.app_public_base_url, &challenge.token);
+        state
+            .mailer
+            .send_ticket_access_link(
+                &checkout.email,
+                &access_url,
+                state.config.email_access_token_ttl_secs,
+            )
+            .await
+            .map_err(|err| ApiError::internal(format!("email access dispatch failed: {err}")))?;
+    }
+
+    Ok(Json(serde_json::json!({ "received": true })))
+}
+
+fn validate_stripe_checkout_session(
+    session: &Value,
+    checkout: &FiatCheckoutSessionRow,
+) -> Result<(), ApiError> {
+    if !matches!(checkout.status.as_str(), "pending" | "paid") {
+        return Err(ApiError::bad_request("fiat checkout is not payable"));
+    }
+
+    let client_reference_id = session["client_reference_id"]
+        .as_str()
+        .ok_or_else(|| ApiError::bad_request("missing stripe client reference id"))?;
+    if client_reference_id != checkout.id {
+        return Err(ApiError::bad_request("stripe client reference id mismatch"));
+    }
+
+    let metadata_checkout_id = session["metadata"]["fiat_checkout_id"]
+        .as_str()
+        .ok_or_else(|| ApiError::bad_request("missing stripe checkout metadata"))?;
+    if metadata_checkout_id != checkout.id {
+        return Err(ApiError::bad_request("stripe checkout metadata mismatch"));
+    }
+
+    let amount_total = session["amount_total"]
+        .as_i64()
+        .ok_or_else(|| ApiError::bad_request("missing stripe amount total"))?;
+    if amount_total != checkout.final_amount_cents {
+        return Err(ApiError::bad_request("stripe amount total mismatch"));
+    }
+
+    let currency = session["currency"]
+        .as_str()
+        .ok_or_else(|| ApiError::bad_request("missing stripe currency"))?;
+    if !currency.eq_ignore_ascii_case(&checkout.currency) {
+        return Err(ApiError::bad_request("stripe currency mismatch"));
+    }
+
+    Ok(())
+}
+
+fn build_email_access_url(base_url: &str, token: &str) -> String {
+    format!(
+        "{}/en/tickets/email-access?token={}",
+        base_url.trim_end_matches('/'),
+        token
+    )
+}
+
+async fn resolve_fiat_referral(
+    state: &Arc<AppState>,
+    referral_code: Option<&str>,
+) -> Result<Option<i64>, ApiError> {
+    let Some(referral_code) = referral_code.and_then(normalize_promotion_code) else {
+        return Ok(None);
+    };
+    let code = state
+        .db
+        .find_promotion_code(&referral_code)
+        .await
+        .map_err(|err| ApiError::internal(format!("load referral code failed: {err}")))?;
+    Ok(code.and_then(|code| {
+        if code.kind == "referral" && code.status == "active" {
+            Some(code.id)
+        } else {
+            None
+        }
+    }))
+}
+
+fn build_stripe_line_items(
+    level_ids: &[u8],
+    quantities: &[u64],
+    unit_prices: &[String],
+    decimals: u8,
+    final_amount_cents: i64,
+    discount_amount_cents: i64,
+) -> Result<Vec<StripeCheckoutLineItem>, ApiError> {
+    if level_ids.len() != quantities.len() || level_ids.len() != unit_prices.len() {
+        return Err(ApiError::bad_request("quote line item count mismatch"));
+    }
+    if discount_amount_cents > 0 {
+        return Ok(vec![StripeCheckoutLineItem {
+            name: "Money Frontier Summit 2026 Ticket Order".to_string(),
+            unit_amount: final_amount_cents,
+            quantity: 1,
+        }]);
+    }
+
+    level_ids
+        .iter()
+        .zip(quantities)
+        .zip(unit_prices)
+        .map(|((level_id, quantity), unit_price)| {
+            Ok(StripeCheckoutLineItem {
+                name: format!("Money Frontier Summit 2026 - Level {level_id}"),
+                unit_amount: token_amount_to_cents(parse_u256_decimal(unit_price)?, decimals)?,
+                quantity: i64::try_from(*quantity)
+                    .map_err(|_| ApiError::bad_request("quantity is too large"))?,
+            })
+        })
+        .collect()
+}
+
+fn token_unit_prices_to_cents(unit_prices: &[String], decimals: u8) -> Result<Vec<i64>, ApiError> {
+    unit_prices
+        .iter()
+        .map(|unit_price| token_amount_to_cents(parse_u256_decimal(unit_price)?, decimals))
+        .collect()
+}
+
+fn token_amount_to_cents(amount: U256, decimals: u8) -> Result<i64, ApiError> {
+    let cents = amount
+        .checked_mul(U256::from(100u64))
+        .ok_or_else(|| ApiError::bad_request("amount conversion overflow"))?
+        / U256::from(10u64).pow(U256::from(decimals));
+    if cents > U256::from(i64::MAX as u64) {
+        return Err(ApiError::bad_request("amount is too large"));
+    }
+    Ok(cents.as_u64() as i64)
 }
 
 pub async fn create_purchase_intent(
@@ -552,12 +994,18 @@ pub async fn list_tickets(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<TicketView>>, ApiError> {
-    let wallet = extract_wallet(&headers, &state.jwt)?;
-    let tickets = state
-        .db
-        .list_active_tickets_by_wallet(&wallet)
-        .await
-        .map_err(|err| ApiError::internal(format!("query tickets failed: {err}")))?;
+    let tickets = match extract_ticket_auth_subject(&headers, &state.jwt)? {
+        TicketAuthSubject::Wallet(wallet) => state
+            .db
+            .list_active_tickets_by_wallet(&wallet)
+            .await
+            .map_err(|err| ApiError::internal(format!("query tickets failed: {err}")))?,
+        TicketAuthSubject::Email(email) => state
+            .db
+            .list_active_tickets_by_email(&email)
+            .await
+            .map_err(|err| ApiError::internal(format!("query tickets failed: {err}")))?,
+    };
 
     Ok(Json(tickets.into_iter().map(TicketView::from).collect()))
 }
@@ -632,12 +1080,18 @@ pub async fn get_ticket(
     headers: HeaderMap,
     Path(ticket_id): Path<String>,
 ) -> Result<Json<TicketView>, ApiError> {
-    let wallet = extract_wallet(&headers, &state.jwt)?;
-    let ticket = state
-        .db
-        .get_active_ticket_by_id_for_wallet(&ticket_id, &wallet)
-        .await
-        .map_err(|err| ApiError::internal(format!("query ticket failed: {err}")))?;
+    let ticket = match extract_ticket_auth_subject(&headers, &state.jwt)? {
+        TicketAuthSubject::Wallet(wallet) => state
+            .db
+            .get_active_ticket_by_id_for_wallet(&ticket_id, &wallet)
+            .await
+            .map_err(|err| ApiError::internal(format!("query ticket failed: {err}")))?,
+        TicketAuthSubject::Email(email) => state
+            .db
+            .get_active_ticket_by_id_for_email(&ticket_id, &email)
+            .await
+            .map_err(|err| ApiError::internal(format!("query ticket failed: {err}")))?,
+    };
 
     let ticket = ticket.ok_or_else(|| ApiError::not_found("ticket not found"))?;
     Ok(Json(ticket.into()))
@@ -702,6 +1156,39 @@ fn validate_transfer_request(req: &TransferTicketRequest) -> Result<(), ApiError
 
 fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
+}
+
+fn normalize_email_checked(email: &str) -> Result<String, ApiError> {
+    let email = normalize_email(email);
+    let has_single_at = email.matches('@').count() == 1;
+    let has_dot_after_at = email
+        .split_once('@')
+        .map(|(_, domain)| {
+            domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+        })
+        .unwrap_or(false);
+    if email.is_empty() || !has_single_at || !has_dot_after_at {
+        return Err(ApiError::bad_request("invalid email address"));
+    }
+    Ok(email)
+}
+
+enum TicketAuthSubject {
+    Wallet(String),
+    Email(String),
+}
+
+fn extract_ticket_auth_subject(
+    headers: &HeaderMap,
+    jwt: &crate::auth::JwtCodec,
+) -> Result<TicketAuthSubject, ApiError> {
+    match extract_wallet(headers, jwt) {
+        Ok(wallet) => Ok(TicketAuthSubject::Wallet(wallet)),
+        Err(wallet_err) => match extract_email_session(headers, jwt) {
+            Ok(email) => Ok(TicketAuthSubject::Email(email)),
+            Err(_) => Err(wallet_err),
+        },
+    }
 }
 
 fn validate_purchase_intent_request(req: &CreatePurchaseIntentRequest) -> Result<(), ApiError> {
@@ -1125,18 +1612,23 @@ mod tests {
     use async_trait::async_trait;
     use axum::{
         body::{to_bytes, Body},
+        extract::State,
         http::{Method, Request, StatusCode},
         routing::{get, post},
-        Router,
+        Json, Router,
     };
     use ethers_signers::{LocalWallet, Signer};
+    use hmac::{Hmac, Mac};
     use serde_json::{json, Value};
+    use sha2::Sha256;
     use tower::util::ServiceExt;
 
     use super::{
-        create_purchase_intent, create_purchase_quote, get_purchase_intent, get_ticket, health,
+        create_fiat_checkout_session, create_purchase_intent, create_purchase_quote,
+        email_access_challenge, email_access_verify, get_purchase_intent, get_ticket, health,
         list_ticket_prices, list_tickets, notify_tickets, parse_token_amount, signin_challenge,
-        signin_verify, transfer_ticket, unix_now, validate_transfer_request, TransferTicketRequest,
+        signin_verify, stripe_webhook, transfer_ticket, unix_now, validate_transfer_request,
+        TransferTicketRequest,
     };
     use crate::{
         auth::JwtCodec,
@@ -1159,6 +1651,16 @@ mod tests {
         state: Mutex<MockChainState>,
     }
 
+    #[derive(Clone, Default)]
+    struct StripeCapture {
+        body: Arc<Mutex<Option<String>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MailCapture {
+        count: Arc<Mutex<usize>>,
+    }
+
     impl MockChain {
         fn set_tx_events(&self, chain_id: u64, tx_hash: &str, events: Vec<DecodedPurchase>) {
             let mut guard = self.state.lock().expect("lock should succeed");
@@ -1179,6 +1681,68 @@ mod tests {
                 .quotes
                 .insert((chain_id, level_ids.to_vec(), quantities.to_vec()), quote);
         }
+    }
+
+    async fn stripe_checkout_capture(
+        State(state): State<StripeCapture>,
+        body: String,
+    ) -> Json<Value> {
+        *state.body.lock().expect("capture lock should succeed") = Some(body);
+        Json(json!({
+            "id": "cs_test_money_frontier",
+            "url": "https://checkout.stripe.test/session"
+        }))
+    }
+
+    async fn spawn_stripe_capture(state: StripeCapture) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let app = Router::new()
+            .route("/v1/checkout/sessions", post(stripe_checkout_capture))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stripe capture should serve");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn mail_capture(State(state): State<MailCapture>, body: String) -> Json<Value> {
+        assert!(body.contains("guest@example.com"));
+        *state.count.lock().expect("capture lock should succeed") += 1;
+        Json(json!({ "ok": true }))
+    }
+
+    async fn spawn_mail_capture(state: MailCapture) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let app = Router::new()
+            .route("/mail", post(mail_capture))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mail capture should serve");
+        });
+        (format!("http://{addr}/mail"), handle)
+    }
+
+    fn stripe_signature_header(payload: &str, secret: &str, timestamp: i64) -> String {
+        let signed_payload = format!("{timestamp}.{payload}");
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac should initialize");
+        mac.update(signed_payload.as_bytes());
+        let bytes = mac.finalize().into_bytes();
+        let signature = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("t={timestamp},v1={signature}")
     }
 
     #[async_trait]
@@ -1245,6 +1809,13 @@ mod tests {
             .route("/health", get(health))
             .route("/signin/challenge", post(signin_challenge))
             .route("/signin", post(signin_verify))
+            .route("/email/access/challenge", post(email_access_challenge))
+            .route("/email/access/verify", post(email_access_verify))
+            .route(
+                "/fiat/checkout-sessions",
+                post(create_fiat_checkout_session),
+            )
+            .route("/stripe/webhook", post(stripe_webhook))
             .route("/purchase-prices", post(list_ticket_prices))
             .route("/purchase-quotes", post(create_purchase_quote))
             .route("/purchase-intents", post(create_purchase_intent))
@@ -1255,17 +1826,25 @@ mod tests {
     }
 
     async fn build_test_app(mock_chain: Arc<MockChain>) -> (Router, Arc<AppState>) {
+        build_test_app_with_config(mock_chain, |_| {}).await
+    }
+
+    async fn build_test_app_with_config(
+        mock_chain: Arc<MockChain>,
+        configure: impl FnOnce(&mut AppConfig),
+    ) -> (Router, Arc<AppState>) {
         let database_url = "sqlite::memory:".to_string();
         let db = Db::connect(&database_url)
             .await
             .expect("db connect should succeed");
 
-        let config = AppConfig {
+        let mut config = AppConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid addr"),
             database_url,
             jwt_secret: "test-secret".to_string(),
             jwt_ttl_days: 3650,
             mail_from: "noreply@test.local".to_string(),
+            mail_reply_to: None,
             mail_provider: "console".to_string(),
             mail_webhook_url: None,
             mail_api_key: None,
@@ -1273,6 +1852,20 @@ mod tests {
             mail_retry_backoff_ms: 1,
             mail_alert_webhook_url: None,
             mail_alert_api_key: None,
+            app_public_base_url: "http://127.0.0.1:3000".to_string(),
+            email_access_token_ttl_secs: 900,
+            email_session_ttl_hours: 24,
+            stripe_enabled: false,
+            stripe_api_key: None,
+            stripe_webhook_secret: None,
+            stripe_api_version: "2026-04-22.dahlia".to_string(),
+            stripe_currency: "usd".to_string(),
+            stripe_success_url: "http://127.0.0.1:3000/success".to_string(),
+            stripe_cancel_url: "http://127.0.0.1:3000/cancelled".to_string(),
+            stripe_api_base_url: "https://api.stripe.com".to_string(),
+            fiat_price_chain_id: 56,
+            fiat_price_payment_token: "0x55d398326f99059ff775485246999027b3197955".to_string(),
+            fiat_checkout_session_ttl_secs: 1800,
             chains: vec![ChainConfig {
                 chain_id: 56,
                 rpc_url: "http://localhost:8545".to_string(),
@@ -1292,6 +1885,7 @@ mod tests {
             ),
             admin_jwt_ttl_hours: 12,
         };
+        configure(&mut config);
 
         let jwt = JwtCodec::new(&config.jwt_secret, config.jwt_ttl_days)
             .expect("jwt init should succeed");
@@ -1398,6 +1992,538 @@ mod tests {
         assert_eq!(body["prices"][0]["unit_price"], "100000000000000000000");
         assert_eq!(body["prices"][1]["unit_price"], "499000000000000000000");
         assert_eq!(body["prices"][2]["unit_price"], "1989000000000000000000");
+    }
+
+    #[tokio::test]
+    async fn email_access_verify_returns_session_that_lists_email_tickets() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain.clone()).await;
+        let buyer = "0x1111111111111111111111111111111111111111";
+        let email = "guest@example.com";
+
+        state
+            .db
+            .index_purchase(
+                56,
+                &DecodedPurchase {
+                    tx_hash: "0xemail".to_string(),
+                    log_index: 0,
+                    block_number: 100,
+                    block_hash: Some("0xblock".to_string()),
+                    order_id: "email-order".to_string(),
+                    buyer: buyer.to_string(),
+                    payment_token: "0x2222222222222222222222222222222222222222".to_string(),
+                    total_amount: "1000000000000000000".to_string(),
+                    level_ids: vec![1],
+                    quantities: vec![1],
+                    unit_prices: vec!["1000000000000000000".to_string()],
+                    intent_id: None,
+                },
+            )
+            .await
+            .expect("purchase should index");
+
+        let wallet_tickets = state
+            .db
+            .list_active_tickets_by_wallet(buyer)
+            .await
+            .expect("wallet tickets should load");
+        state
+            .db
+            .transfer_ticket(&wallet_tickets[0].id, buyer, None, Some(email))
+            .await
+            .expect("ticket should transfer to email");
+
+        let challenge = state
+            .db
+            .create_email_access_challenge(email, 900)
+            .await
+            .expect("email challenge should create");
+
+        let (status, verify_body) = json_request(
+            &app,
+            Method::POST,
+            "/email/access/verify",
+            None,
+            Some(json!({ "token": challenge.token })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(verify_body["email"], email);
+        let email_token = verify_body["token"].as_str().expect("token should exist");
+
+        let (status, tickets_body) =
+            json_request(&app, Method::GET, "/tickets", Some(email_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tickets_body.as_array().expect("tickets array").len(), 1);
+        assert_eq!(tickets_body[0]["owner_email"], email);
+    }
+
+    #[tokio::test]
+    async fn fiat_checkout_creates_stripe_session_without_payment_method_types() {
+        let mock_chain = Arc::new(MockChain::default());
+        mock_chain.set_quote(
+            56,
+            &[1],
+            &[2],
+            QuoteResult {
+                total_amount: "176000000000000000000".to_string(),
+                unit_prices: vec!["88000000000000000000".to_string()],
+            },
+        );
+        let capture = StripeCapture::default();
+        let (stripe_url, stripe_handle) = spawn_stripe_capture(capture.clone()).await;
+        let (app, _state) = build_test_app_with_config(mock_chain, |config| {
+            config.stripe_enabled = true;
+            config.stripe_api_key = Some("sk_test_local".to_string());
+            config.stripe_api_base_url = stripe_url;
+            config.fiat_price_chain_id = 56;
+            config.fiat_price_payment_token =
+                "0x55d398326f99059ff775485246999027b3197955".to_string();
+        })
+        .await;
+
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/fiat/checkout-sessions",
+            None,
+            Some(json!({
+                "email": "guest@example.com",
+                "level_ids": [1],
+                "quantities": [2]
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["stripe_session_id"], "cs_test_money_frontier");
+        assert_eq!(body["url"], "https://checkout.stripe.test/session");
+        assert_eq!(body["original_amount_cents"], 17600);
+        assert_eq!(body["final_amount_cents"], 17600);
+
+        let captured_body = capture
+            .body
+            .lock()
+            .expect("capture lock should succeed")
+            .clone()
+            .expect("stripe request body should be captured");
+        assert!(!captured_body.contains("payment_method_types"));
+        assert!(captured_body.contains("mode=payment"));
+        assert!(captured_body.contains("customer_email=guest%40example.com"));
+        assert!(captured_body.contains("line_items%5B0%5D%5Bprice_data%5D%5Bunit_amount%5D=8800"));
+        assert!(captured_body.contains("line_items%5B0%5D%5Bquantity%5D=2"));
+
+        stripe_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fiat_checkout_charges_final_discounted_amount_in_stripe() {
+        let mock_chain = Arc::new(MockChain::default());
+        mock_chain.set_quote(
+            56,
+            &[1],
+            &[1],
+            QuoteResult {
+                total_amount: "88000000000000000000".to_string(),
+                unit_prices: vec!["88000000000000000000".to_string()],
+            },
+        );
+        let capture = StripeCapture::default();
+        let (stripe_url, stripe_handle) = spawn_stripe_capture(capture.clone()).await;
+        let (app, state) = build_test_app_with_config(mock_chain, |config| {
+            config.stripe_enabled = true;
+            config.stripe_api_key = Some("sk_test_local".to_string());
+            config.stripe_api_base_url = stripe_url;
+        })
+        .await;
+        state
+            .db
+            .seed_fixed_discount_code("save8", "8")
+            .await
+            .expect("discount code seed should succeed");
+
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/fiat/checkout-sessions",
+            None,
+            Some(json!({
+                "email": "guest@example.com",
+                "level_ids": [1],
+                "quantities": [1],
+                "discount_code": "save8"
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["original_amount_cents"], 8800);
+        assert_eq!(body["discount_amount_cents"], 800);
+        assert_eq!(body["final_amount_cents"], 8000);
+
+        let captured_body = capture
+            .body
+            .lock()
+            .expect("capture lock should succeed")
+            .clone()
+            .expect("stripe request body should be captured");
+        assert!(captured_body.contains("line_items%5B0%5D%5Bprice_data%5D%5Bunit_amount%5D=8000"));
+        assert!(!captured_body.contains("line_items%5B0%5D%5Bprice_data%5D%5Bunit_amount%5D=8800"));
+
+        stripe_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stripe_webhook_paid_session_creates_email_tickets_once() {
+        let mock_chain = Arc::new(MockChain::default());
+        mock_chain.set_quote(
+            56,
+            &[1],
+            &[2],
+            QuoteResult {
+                total_amount: "176000000000000000000".to_string(),
+                unit_prices: vec!["88000000000000000000".to_string()],
+            },
+        );
+        let capture = StripeCapture::default();
+        let (stripe_url, stripe_handle) = spawn_stripe_capture(capture).await;
+        let mail_capture = MailCapture::default();
+        let (mail_url, mail_handle) = spawn_mail_capture(mail_capture.clone()).await;
+        let webhook_secret = "whsec_local_test";
+        let (app, state) = build_test_app_with_config(mock_chain, |config| {
+            config.stripe_enabled = true;
+            config.stripe_api_key = Some("sk_test_local".to_string());
+            config.stripe_webhook_secret = Some(webhook_secret.to_string());
+            config.stripe_api_base_url = stripe_url;
+            config.mail_provider = "webhook".to_string();
+            config.mail_webhook_url = Some(mail_url);
+        })
+        .await;
+
+        let (status, _) = json_request(
+            &app,
+            Method::POST,
+            "/fiat/checkout-sessions",
+            None,
+            Some(json!({
+                "email": "guest@example.com",
+                "level_ids": [1],
+                "quantities": [2]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let checkout = state
+            .db
+            .get_fiat_checkout_session_by_stripe_id("cs_test_money_frontier")
+            .await
+            .expect("checkout should load")
+            .expect("checkout should exist");
+        let payload = json!({
+            "id": "evt_test",
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "id": "cs_test_money_frontier",
+                    "client_reference_id": checkout.id,
+                    "metadata": {
+                        "fiat_checkout_id": checkout.id
+                    },
+                    "amount_total": 17600,
+                    "currency": "usd",
+                    "payment_status": "paid",
+                    "payment_intent": "pi_test_money_frontier"
+                }
+            }
+        })
+        .to_string();
+        let signature = stripe_signature_header(&payload, webhook_secret, unix_now());
+
+        for _ in 0..2 {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/stripe/webhook")
+                .header("stripe-signature", &signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.clone()))
+                .expect("request should build");
+            let response = app
+                .clone()
+                .oneshot(req)
+                .await
+                .expect("request should succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let tickets = state
+            .db
+            .list_active_tickets_by_email("guest@example.com")
+            .await
+            .expect("email tickets should load");
+        assert_eq!(tickets.len(), 2);
+        assert_eq!(tickets[0].unit_price, "8800");
+        assert_eq!(tickets[1].unit_price, "8800");
+        let checkout = state
+            .db
+            .get_fiat_checkout_session_by_stripe_id("cs_test_money_frontier")
+            .await
+            .expect("checkout should load")
+            .expect("checkout should exist");
+        assert_eq!(checkout.status, "paid");
+        assert_eq!(checkout.created_tickets, 2);
+        assert_eq!(
+            *mail_capture
+                .count
+                .lock()
+                .expect("capture lock should succeed"),
+            1
+        );
+
+        stripe_handle.abort();
+        mail_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stripe_webhook_rejects_paid_session_when_signature_is_invalid() {
+        let mock_chain = Arc::new(MockChain::default());
+        mock_chain.set_quote(
+            56,
+            &[1],
+            &[1],
+            QuoteResult {
+                total_amount: "88000000000000000000".to_string(),
+                unit_prices: vec!["88000000000000000000".to_string()],
+            },
+        );
+        let capture = StripeCapture::default();
+        let (stripe_url, stripe_handle) = spawn_stripe_capture(capture).await;
+        let webhook_secret = "whsec_local_test";
+        let (app, state) = build_test_app_with_config(mock_chain, |config| {
+            config.stripe_enabled = true;
+            config.stripe_api_key = Some("sk_test_local".to_string());
+            config.stripe_webhook_secret = Some(webhook_secret.to_string());
+            config.stripe_api_base_url = stripe_url;
+        })
+        .await;
+
+        let (status, _) = json_request(
+            &app,
+            Method::POST,
+            "/fiat/checkout-sessions",
+            None,
+            Some(json!({
+                "email": "guest@example.com",
+                "level_ids": [1],
+                "quantities": [1]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let payload = json!({
+            "id": "evt_test",
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "id": "cs_test_money_frontier",
+                    "client_reference_id": state
+                        .db
+                        .get_fiat_checkout_session_by_stripe_id("cs_test_money_frontier")
+                        .await
+                        .expect("checkout lookup should succeed")
+                        .expect("checkout should exist")
+                        .id,
+                    "metadata": {
+                        "fiat_checkout_id": state
+                            .db
+                            .get_fiat_checkout_session_by_stripe_id("cs_test_money_frontier")
+                            .await
+                            .expect("checkout lookup should succeed")
+                            .expect("checkout should exist")
+                            .id
+                    },
+                    "amount_total": 8800,
+                    "currency": "usd",
+                    "payment_status": "paid",
+                    "payment_intent": "pi_test_money_frontier"
+                }
+            }
+        })
+        .to_string();
+        let signature = stripe_signature_header(&payload, "wrong_secret", unix_now());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/stripe/webhook")
+            .header("stripe-signature", &signature)
+            .header("content-type", "application/json")
+            .body(Body::from(payload))
+            .expect("request should build");
+        let response = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let checkout = state
+            .db
+            .get_fiat_checkout_session_by_stripe_id("cs_test_money_frontier")
+            .await
+            .expect("checkout should load")
+            .expect("checkout should exist");
+        assert_eq!(checkout.status, "pending");
+        assert_eq!(checkout.created_tickets, 0);
+
+        stripe_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stripe_webhook_rejects_paid_session_when_amount_currency_or_metadata_mismatch() {
+        let mock_chain = Arc::new(MockChain::default());
+        mock_chain.set_quote(
+            56,
+            &[1],
+            &[1],
+            QuoteResult {
+                total_amount: "88000000000000000000".to_string(),
+                unit_prices: vec!["88000000000000000000".to_string()],
+            },
+        );
+        let capture = StripeCapture::default();
+        let (stripe_url, stripe_handle) = spawn_stripe_capture(capture).await;
+        let webhook_secret = "whsec_local_test";
+        let (app, state) = build_test_app_with_config(mock_chain, |config| {
+            config.stripe_enabled = true;
+            config.stripe_api_key = Some("sk_test_local".to_string());
+            config.stripe_webhook_secret = Some(webhook_secret.to_string());
+            config.stripe_api_base_url = stripe_url;
+        })
+        .await;
+
+        let (status, _) = json_request(
+            &app,
+            Method::POST,
+            "/fiat/checkout-sessions",
+            None,
+            Some(json!({
+                "email": "guest@example.com",
+                "level_ids": [1],
+                "quantities": [1]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let checkout = state
+            .db
+            .get_fiat_checkout_session_by_stripe_id("cs_test_money_frontier")
+            .await
+            .expect("checkout should load")
+            .expect("checkout should exist");
+
+        for session in [
+            json!({
+                "id": "cs_test_money_frontier",
+                "client_reference_id": checkout.id,
+                "metadata": { "fiat_checkout_id": checkout.id },
+                "amount_total": 8700,
+                "currency": "usd",
+                "payment_status": "paid",
+                "payment_intent": "pi_test_money_frontier"
+            }),
+            json!({
+                "id": "cs_test_money_frontier",
+                "client_reference_id": checkout.id,
+                "metadata": { "fiat_checkout_id": checkout.id },
+                "amount_total": 8800,
+                "currency": "eur",
+                "payment_status": "paid",
+                "payment_intent": "pi_test_money_frontier"
+            }),
+            json!({
+                "id": "cs_test_money_frontier",
+                "client_reference_id": "other-checkout",
+                "metadata": { "fiat_checkout_id": "other-checkout" },
+                "amount_total": 8800,
+                "currency": "usd",
+                "payment_status": "paid",
+                "payment_intent": "pi_test_money_frontier"
+            }),
+        ] {
+            let payload = json!({
+                "id": "evt_test",
+                "type": "checkout.session.completed",
+                "data": { "object": session }
+            })
+            .to_string();
+            let signature = stripe_signature_header(&payload, webhook_secret, unix_now());
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/stripe/webhook")
+                .header("stripe-signature", &signature)
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .expect("request should build");
+            let response = app
+                .clone()
+                .oneshot(req)
+                .await
+                .expect("request should succeed");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let checkout = state
+            .db
+            .get_fiat_checkout_session_by_stripe_id("cs_test_money_frontier")
+            .await
+            .expect("checkout should load")
+            .expect("checkout should exist");
+        assert_eq!(checkout.status, "pending");
+        assert_eq!(checkout.created_tickets, 0);
+
+        stripe_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stripe_webhook_ignores_paid_sessions_without_money_frontier_metadata() {
+        let mock_chain = Arc::new(MockChain::default());
+        let webhook_secret = "whsec_local_test";
+        let (app, _state) = build_test_app_with_config(mock_chain, |config| {
+            config.stripe_enabled = true;
+            config.stripe_webhook_secret = Some(webhook_secret.to_string());
+        })
+        .await;
+
+        let payload = json!({
+            "id": "evt_test",
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "id": "cs_test_other_service",
+                    "amount_total": 8800,
+                    "currency": "usd",
+                    "payment_status": "paid",
+                    "payment_intent": "pi_test_other_service"
+                }
+            }
+        })
+        .to_string();
+        let signature = stripe_signature_header(&payload, webhook_secret, unix_now());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/stripe/webhook")
+            .header("stripe-signature", &signature)
+            .header("content-type", "application/json")
+            .body(Body::from(payload))
+            .expect("request should build");
+        let response = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

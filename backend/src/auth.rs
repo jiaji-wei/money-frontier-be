@@ -11,6 +11,8 @@ use crate::error::ApiError;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
+    #[serde(default)]
+    pub scope: Option<String>,
     pub iat: usize,
     pub exp: usize,
 }
@@ -20,6 +22,14 @@ pub struct AdminClaims {
     pub sub: String,
     pub scope: String,
     pub role: String,
+    pub iat: usize,
+    pub exp: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailClaims {
+    pub sub: String,
+    pub scope: String,
     pub iat: usize,
     pub exp: usize,
 }
@@ -49,6 +59,7 @@ impl JwtCodec {
         let exp = iat + Duration::days(self.ttl_days);
         let claims = Claims {
             sub: wallet.to_owned(),
+            scope: Some("wallet".to_string()),
             iat: iat.timestamp() as usize,
             exp: exp.timestamp() as usize,
         };
@@ -63,6 +74,41 @@ impl JwtCodec {
         let validation = Validation::new(Algorithm::HS256);
         let data = decode::<Claims>(token, &self.decoding_key, &validation)
             .map_err(|_| ApiError::unauthorized("invalid jwt"))?;
+        if matches!(data.claims.scope.as_deref(), Some(scope) if scope != "wallet") {
+            return Err(ApiError::unauthorized("invalid jwt scope"));
+        }
+        Ok(data.claims)
+    }
+
+    pub fn issue_email_session(
+        &self,
+        email: &str,
+        ttl_hours: i64,
+    ) -> Result<(String, i64), ApiError> {
+        let iat = Utc::now();
+        let exp = iat + Duration::hours(ttl_hours);
+        let claims = EmailClaims {
+            sub: email.to_owned(),
+            scope: "email_ticket_access".to_string(),
+            iat: iat.timestamp() as usize,
+            exp: exp.timestamp() as usize,
+        };
+
+        let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)
+            .map_err(|err| ApiError::internal(format!("email jwt encode failed: {err}")))?;
+
+        Ok((token, exp.timestamp()))
+    }
+
+    pub fn verify_email_session(&self, token: &str) -> Result<EmailClaims, ApiError> {
+        let validation = Validation::new(Algorithm::HS256);
+        let data = decode::<EmailClaims>(token, &self.decoding_key, &validation)
+            .map_err(|_| ApiError::unauthorized("invalid email jwt"))?;
+
+        if data.claims.scope != "email_ticket_access" {
+            return Err(ApiError::unauthorized("invalid email jwt scope"));
+        }
+
         Ok(data.claims)
     }
 
@@ -123,6 +169,20 @@ pub fn extract_wallet(headers: &HeaderMap, jwt: &JwtCodec) -> Result<String, Api
         .ok_or_else(|| ApiError::unauthorized("invalid authorization header"))?;
 
     let claims = jwt.verify(token)?;
+    Ok(claims.sub)
+}
+
+pub fn extract_email_session(headers: &HeaderMap, jwt: &JwtCodec) -> Result<String, ApiError> {
+    let raw_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::unauthorized("missing authorization header"))?;
+
+    let token = raw_header
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| ApiError::unauthorized("invalid authorization header"))?;
+
+    let claims = jwt.verify_email_session(token)?;
     Ok(claims.sub)
 }
 
@@ -204,6 +264,31 @@ mod tests {
         let err = jwt
             .verify_admin(&token)
             .expect_err("invalid admin role must not verify");
+
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn email_session_jwt_round_trips_and_rejects_buyer_token() {
+        let jwt = JwtCodec::new("test-secret", 1).expect("jwt codec should initialize");
+
+        let (email_token, expires_at) = jwt
+            .issue_email_session("guest@example.com", 24)
+            .expect("email jwt should issue");
+        let email_claims = jwt
+            .verify_email_session(&email_token)
+            .expect("email jwt should verify");
+
+        assert_eq!(email_claims.sub, "guest@example.com");
+        assert_eq!(email_claims.scope, "email_ticket_access");
+        assert!(expires_at > email_claims.iat as i64);
+
+        let (buyer_token, _) = jwt
+            .issue("0x1111111111111111111111111111111111111111")
+            .expect("buyer jwt should issue");
+        let err = jwt
+            .verify_email_session(&buyer_token)
+            .expect_err("buyer jwt must not verify as email session");
 
         assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
     }
