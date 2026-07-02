@@ -183,6 +183,24 @@ pub struct TicketPricesResponse {
     pub prices: Vec<TicketPriceView>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RedeemRedemptionCodeRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RedeemRedemptionCodeByEmailRequest {
+    pub code: String,
+    pub email: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RedeemRedemptionCodeResponse {
+    pub code: String,
+    pub claim_id: String,
+    pub ticket: TicketView,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PurchaseIntentResponse {
     pub id: String,
@@ -1010,6 +1028,51 @@ pub async fn list_tickets(
     Ok(Json(tickets.into_iter().map(TicketView::from).collect()))
 }
 
+pub async fn redeem_redemption_code(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<RedeemRedemptionCodeRequest>,
+) -> Result<Json<RedeemRedemptionCodeResponse>, ApiError> {
+    let (claimant_type, claimant) = match extract_ticket_auth_subject(&headers, &state.jwt)? {
+        TicketAuthSubject::Wallet(wallet) => ("wallet", wallet),
+        TicketAuthSubject::Email(email) => ("email", normalize_email(&email)),
+    };
+
+    let result = state
+        .db
+        .redeem_redemption_code(&req.code, claimant_type, &claimant)
+        .await
+        .map_err(|err| ApiError::internal(format!("redeem code failed: {err}")))?;
+
+    let result = result.ok_or_else(|| ApiError::bad_request("redemption code is not active"))?;
+
+    Ok(Json(RedeemRedemptionCodeResponse {
+        code: result.code.code_normalized,
+        claim_id: result.claim.id,
+        ticket: result.ticket.into(),
+    }))
+}
+
+pub async fn redeem_redemption_code_by_email(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RedeemRedemptionCodeByEmailRequest>,
+) -> Result<Json<RedeemRedemptionCodeResponse>, ApiError> {
+    let email = normalize_email_checked(&req.email)?;
+    let result = state
+        .db
+        .redeem_redemption_code(&req.code, "email", &email)
+        .await
+        .map_err(|err| ApiError::internal(format!("redeem code failed: {err}")))?;
+
+    let result = result.ok_or_else(|| ApiError::bad_request("redemption code is not active"))?;
+
+    Ok(Json(RedeemRedemptionCodeResponse {
+        code: result.code.code_normalized,
+        claim_id: result.claim.id,
+        ticket: result.ticket.into(),
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct NotifyRequest {
     pub chain_id: u64,
@@ -1185,7 +1248,7 @@ fn extract_ticket_auth_subject(
     match extract_wallet(headers, jwt) {
         Ok(wallet) => Ok(TicketAuthSubject::Wallet(wallet)),
         Err(wallet_err) => match extract_email_session(headers, jwt) {
-            Ok(email) => Ok(TicketAuthSubject::Email(email)),
+            Ok(email) => Ok(TicketAuthSubject::Email(normalize_email(&email))),
             Err(_) => Err(wallet_err),
         },
     }
@@ -1626,15 +1689,16 @@ mod tests {
     use super::{
         create_fiat_checkout_session, create_purchase_intent, create_purchase_quote,
         email_access_challenge, email_access_verify, get_purchase_intent, get_ticket, health,
-        list_ticket_prices, list_tickets, notify_tickets, parse_token_amount, signin_challenge,
-        signin_verify, stripe_webhook, transfer_ticket, unix_now, validate_transfer_request,
+        list_ticket_prices, list_tickets, notify_tickets, parse_token_amount,
+        redeem_redemption_code, redeem_redemption_code_by_email, signin_challenge, signin_verify,
+        stripe_webhook, transfer_ticket, unix_now, validate_transfer_request,
         TransferTicketRequest,
     };
     use crate::{
         auth::JwtCodec,
         chain::{ChainReader, ChainRuntimeConfig, DecodedPurchase, QuoteResult},
         config::{AppConfig, ChainConfig},
-        db::{Db, PurchaseIntentFilters, UpdateInviteCode},
+        db::{Db, NewRedemptionCode, PurchaseIntentFilters, UpdateInviteCode},
         mailer::Mailer,
         promotions::DiscountRedemptionStatus,
         AppState,
@@ -1820,6 +1884,11 @@ mod tests {
             .route("/purchase-quotes", post(create_purchase_quote))
             .route("/purchase-intents", post(create_purchase_intent))
             .route("/purchase-intents/:id", get(get_purchase_intent))
+            .route("/redemption-codes/redeem", post(redeem_redemption_code))
+            .route(
+                "/redemption-codes/redeem-by-email",
+                post(redeem_redemption_code_by_email),
+            )
             .route("/tickets", get(list_tickets).post(notify_tickets))
             .route("/tickets/:id", get(get_ticket).put(transfer_ticket))
             .with_state(state)
@@ -2057,6 +2126,245 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(tickets_body.as_array().expect("tickets array").len(), 1);
         assert_eq!(tickets_body[0]["owner_email"], email);
+    }
+
+    #[tokio::test]
+    async fn wallet_can_redeem_code_into_free_ticket() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain).await;
+        state
+            .db
+            .create_redemption_code(NewRedemptionCode {
+                code: "VIPFREE1".to_string(),
+                status: "active".to_string(),
+                ticket_level: 3,
+                valid_from: None,
+                valid_until: None,
+                notes: None,
+                created_by: "admin".to_string(),
+            })
+            .await
+            .expect("redemption code should create");
+        let wallet = "0x0030457e79159bed97aee6eea708441d4cff579b";
+        let (token, _) = state.jwt.issue(wallet).expect("wallet jwt should issue");
+
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/redeem",
+            Some(&token),
+            Some(json!({ "code": "vipfree1" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "VIPFREE1");
+        assert_eq!(body["ticket"]["ticket_level"], 3);
+        assert_eq!(body["ticket"]["owner_wallet"], wallet);
+        assert_eq!(body["ticket"]["owner_email"], Value::Null);
+        assert_eq!(body["ticket"]["unit_price"], "0");
+        assert_eq!(body["ticket"]["chain_id"], 0);
+
+        let code = state
+            .db
+            .find_redemption_code("VIPFREE1")
+            .await
+            .expect("code lookup should succeed")
+            .expect("code should exist");
+        assert_eq!(code.status, "active");
+
+        let (status, tickets_body) =
+            json_request(&app, Method::GET, "/tickets", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tickets_body.as_array().expect("tickets array").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn email_session_redeem_is_idempotent_for_same_code_and_email() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain).await;
+        state
+            .db
+            .create_redemption_code(NewRedemptionCode {
+                code: "EMAILVIP".to_string(),
+                status: "active".to_string(),
+                ticket_level: 2,
+                valid_from: None,
+                valid_until: None,
+                notes: None,
+                created_by: "admin".to_string(),
+            })
+            .await
+            .expect("redemption code should create");
+        let (email_token, _) = state
+            .jwt
+            .issue_email_session("Guest@Example.com", 24)
+            .expect("email jwt should issue");
+
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/redeem",
+            Some(&email_token),
+            Some(json!({ "code": "EMAILVIP" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ticket"]["ticket_level"], 2);
+        assert_eq!(body["ticket"]["owner_wallet"], Value::Null);
+        assert_eq!(body["ticket"]["owner_email"], "guest@example.com");
+
+        let first_claim_id = body["claim_id"].clone();
+        let first_ticket_id = body["ticket"]["id"].clone();
+
+        let (status, duplicate_body) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/redeem",
+            Some(&email_token),
+            Some(json!({ "code": "EMAILVIP" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(duplicate_body["claim_id"], first_claim_id);
+        assert_eq!(duplicate_body["ticket"]["id"], first_ticket_id);
+
+        let (status, tickets_body) =
+            json_request(&app, Method::GET, "/tickets", Some(&email_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tickets_body.as_array().expect("tickets array").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn email_address_can_redeem_public_multi_use_code() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain).await;
+        state
+            .db
+            .create_redemption_code(NewRedemptionCode {
+                code: "SHAREVIP".to_string(),
+                status: "active".to_string(),
+                ticket_level: 3,
+                valid_from: None,
+                valid_until: None,
+                notes: None,
+                created_by: "admin".to_string(),
+            })
+            .await
+            .expect("redemption code should create");
+
+        let (first_status, first_body) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/redeem-by-email",
+            None,
+            Some(json!({
+                "code": "sharevip",
+                "email": " First.Guest@Example.com "
+            })),
+        )
+        .await;
+        let (second_status, second_body) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/redeem-by-email",
+            None,
+            Some(json!({
+                "code": "sharevip",
+                "email": "second.guest@example.com"
+            })),
+        )
+        .await;
+
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(first_body["code"], "SHAREVIP");
+        assert_eq!(first_body["ticket"]["ticket_level"], 3);
+        assert_eq!(first_body["ticket"]["owner_wallet"], Value::Null);
+        assert_eq!(
+            first_body["ticket"]["owner_email"],
+            "first.guest@example.com"
+        );
+        assert_eq!(
+            second_body["ticket"]["owner_email"],
+            "second.guest@example.com"
+        );
+
+        let code = state
+            .db
+            .find_redemption_code("SHAREVIP")
+            .await
+            .expect("code lookup should succeed")
+            .expect("code should exist");
+        assert_eq!(code.status, "active");
+
+        let claims = state
+            .db
+            .list_redemption_code_claims(Some(code.id), 1, 10)
+            .await
+            .expect("claims should load");
+        assert_eq!(claims.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn public_email_redeem_is_idempotent_for_same_code_and_email() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain).await;
+        state
+            .db
+            .create_redemption_code(NewRedemptionCode {
+                code: "IDEMPOT".to_string(),
+                status: "active".to_string(),
+                ticket_level: 1,
+                valid_from: None,
+                valid_until: None,
+                notes: None,
+                created_by: "admin".to_string(),
+            })
+            .await
+            .expect("redemption code should create");
+
+        let (first_status, first_body) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/redeem-by-email",
+            None,
+            Some(json!({
+                "code": "IDEMPOT",
+                "email": "guest@example.com"
+            })),
+        )
+        .await;
+        let (second_status, second_body) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/redeem-by-email",
+            None,
+            Some(json!({
+                "code": "IDEMPOT",
+                "email": "GUEST@example.com"
+            })),
+        )
+        .await;
+
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(first_body["claim_id"], second_body["claim_id"]);
+        assert_eq!(first_body["ticket"]["id"], second_body["ticket"]["id"]);
+
+        let code = state
+            .db
+            .find_redemption_code("IDEMPOT")
+            .await
+            .expect("code lookup should succeed")
+            .expect("code should exist");
+        let claims = state
+            .db
+            .list_redemption_code_claims(Some(code.id), 1, 10)
+            .await
+            .expect("claims should load");
+        assert_eq!(claims.len(), 1);
     }
 
     #[tokio::test]

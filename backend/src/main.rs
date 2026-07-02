@@ -94,6 +94,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/purchase-quotes", post(routes::create_purchase_quote))
         .route("/purchase-intents", post(routes::create_purchase_intent))
         .route("/purchase-intents/:id", get(routes::get_purchase_intent))
+        .route(
+            "/redemption-codes/redeem",
+            post(routes::redeem_redemption_code),
+        )
+        .route(
+            "/redemption-codes/redeem-by-email",
+            post(routes::redeem_redemption_code_by_email),
+        )
         .nest("/admin", admin_routes::router())
         .route(
             "/tickets",

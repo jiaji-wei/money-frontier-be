@@ -13,13 +13,17 @@ use crate::{
     admin::{extract_admin, require_role, AdminPrincipal, AdminRole},
     auth::{normalize_wallet_address, verify_wallet_signature},
     db::{
-        AdminAuditLogRow, AdminOrderRow, AdminReferralBindingRow, AdminWalletRow, NewAdminAuditLog,
-        NewAdminWallet, NewDiscountCode, NewInviteCode, OrderAttributionDiagnostic, OrderFilters,
-        PurchaseIntentDiagnostic, PurchaseIntentFilters, ReferralSettlementRow, UpdateAdminWallet,
-        UpdateDiscountCode, UpdateInviteCode,
+        AdminAuditLogRow, AdminOrderRow, AdminRedemptionClaimRow, AdminReferralBindingRow,
+        AdminWalletRow, NewAdminAuditLog, NewAdminWallet, NewDiscountCode, NewInviteCode,
+        NewRedemptionCode, OrderAttributionDiagnostic, OrderFilters, PurchaseIntentDiagnostic,
+        PurchaseIntentFilters, RedemptionCodeRow, RedemptionCodeStatsRow, ReferralSettlementRow,
+        UpdateAdminWallet, UpdateDiscountCode, UpdateInviteCode, UpdateRedemptionCode,
     },
     error::ApiError,
-    promotions::{normalize_new_invite_code, normalize_new_promotion_code, PromotionCodeRow},
+    promotions::{
+        normalize_new_invite_code, normalize_new_promotion_code, PromotionCodeRow,
+        PROMOTION_CODE_MAX_LEN, PROMOTION_CODE_MIN_LEN, SAFE_PROMOTION_CODE_ALPHABET,
+    },
     AppState,
 };
 
@@ -48,6 +52,26 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/discount-codes/:id/pause", post(pause_discount_code))
         .route("/discount-codes/:id/activate", post(activate_discount_code))
+        .route(
+            "/redemption-codes",
+            get(list_redemption_codes).post(create_redemption_code),
+        )
+        .route("/redemption-codes/bulk", post(bulk_create_redemption_codes))
+        .route("/redemption-codes/stats", get(get_redemption_code_stats))
+        .route("/redemption-codes/claims", get(list_redemption_code_claims))
+        .route(
+            "/redemption-codes/:id",
+            get(get_redemption_code).patch(update_redemption_code),
+        )
+        .route("/redemption-codes/:id/pause", post(pause_redemption_code))
+        .route(
+            "/redemption-codes/:id/activate",
+            post(activate_redemption_code),
+        )
+        .route(
+            "/redemption-codes/:id/claims",
+            get(list_redemption_code_claims_for_code),
+        )
         .route("/referral-bindings", get(list_referral_bindings))
         .route("/purchase-intents", get(list_purchase_intents))
         .route("/purchase-intents/:id", get(get_purchase_intent_diagnostic))
@@ -233,6 +257,16 @@ pub struct ListQuery {
 #[derive(Debug, Serialize)]
 pub struct PromotionCodeListResponse {
     pub items: Vec<PromotionCodeRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RedemptionCodeListResponse {
+    pub items: Vec<RedemptionCodeRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RedemptionClaimListResponse {
+    pub items: Vec<AdminRedemptionClaimRow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -692,6 +726,320 @@ pub async fn activate_discount_code(
     set_discount_code_status(state, headers, id, "active", "discount_code.activate").await
 }
 
+pub async fn list_redemption_codes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<RedemptionCodeListResponse>, ApiError> {
+    require_viewer(&headers, &state).await?;
+    let items = state
+        .db
+        .list_redemption_codes(query.page.unwrap_or(1), query.page_size.unwrap_or(50))
+        .await
+        .map_err(|err| ApiError::internal(format!("list redemption codes failed: {err}")))?;
+
+    Ok(Json(RedemptionCodeListResponse { items }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRedemptionCodeRequest {
+    pub code: String,
+    pub status: Option<String>,
+    pub ticket_level: i64,
+    pub valid_from: Option<i64>,
+    pub valid_until: Option<i64>,
+    pub notes: Option<String>,
+}
+
+pub async fn create_redemption_code(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateRedemptionCodeRequest>,
+) -> Result<Json<RedemptionCodeRow>, ApiError> {
+    let principal = authenticate_admin(&state, &headers).await?;
+    require_role(&principal, &[AdminRole::Operator])?;
+    validate_ticket_level(req.ticket_level)?;
+    let status = req.status.unwrap_or_else(|| "active".to_string());
+    validate_redemption_status(&status)?;
+    let code = normalize_new_promotion_code(&req.code).map_err(ApiError::bad_request)?;
+    if state
+        .db
+        .find_redemption_code(&code)
+        .await
+        .map_err(|err| {
+            ApiError::internal(format!("check duplicate redemption code failed: {err}"))
+        })?
+        .is_some()
+    {
+        return Err(ApiError::bad_request("redemption code already exists"));
+    }
+
+    let row = state
+        .db
+        .create_redemption_code(NewRedemptionCode {
+            code,
+            status,
+            ticket_level: req.ticket_level,
+            valid_from: req.valid_from,
+            valid_until: req.valid_until,
+            notes: req.notes,
+            created_by: principal.wallet.clone(),
+        })
+        .await
+        .map_err(|err| ApiError::bad_request(format!("create redemption code failed: {err}")))?;
+
+    insert_admin_audit(
+        &state,
+        &principal,
+        "redemption_code.create",
+        "redemption_code",
+        Some(row.id.to_string()),
+        None,
+        Some(&row),
+    )
+    .await?;
+
+    Ok(Json(row))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkCreateRedemptionCodesRequest {
+    pub prefix: Option<String>,
+    pub count: i64,
+    pub ticket_level: i64,
+    pub status: Option<String>,
+    pub valid_from: Option<i64>,
+    pub valid_until: Option<i64>,
+    pub notes: Option<String>,
+}
+
+pub async fn bulk_create_redemption_codes(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<BulkCreateRedemptionCodesRequest>,
+) -> Result<Json<RedemptionCodeListResponse>, ApiError> {
+    let principal = authenticate_admin(&state, &headers).await?;
+    require_role(&principal, &[AdminRole::Operator])?;
+    validate_ticket_level(req.ticket_level)?;
+    if !(1..=500).contains(&req.count) {
+        return Err(ApiError::bad_request("bulk count must be within 1..=500"));
+    }
+    let status = req.status.unwrap_or_else(|| "active".to_string());
+    validate_redemption_status(&status)?;
+    let prefix = req
+        .prefix
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase();
+    if !prefix.is_empty()
+        && !prefix
+            .chars()
+            .all(|ch| SAFE_PROMOTION_CODE_ALPHABET.contains(ch))
+    {
+        return Err(ApiError::bad_request(
+            "redemption code prefix must avoid ambiguous characters",
+        ));
+    }
+    if prefix.len() > PROMOTION_CODE_MAX_LEN - PROMOTION_CODE_MIN_LEN {
+        return Err(ApiError::bad_request(
+            "redemption code prefix must be 24 characters or shorter",
+        ));
+    }
+
+    let mut items = Vec::with_capacity(req.count as usize);
+    let mut attempts = 0;
+    while items.len() < req.count as usize {
+        attempts += 1;
+        if attempts > req.count * 20 {
+            return Err(ApiError::internal(
+                "failed to generate unique redemption codes".to_string(),
+            ));
+        }
+        let code = generate_redemption_code(&prefix);
+        if state
+            .db
+            .find_redemption_code(&code)
+            .await
+            .map_err(|err| {
+                ApiError::internal(format!("check duplicate redemption code failed: {err}"))
+            })?
+            .is_some()
+        {
+            continue;
+        }
+        let row = state
+            .db
+            .create_redemption_code(NewRedemptionCode {
+                code,
+                status: status.clone(),
+                ticket_level: req.ticket_level,
+                valid_from: req.valid_from,
+                valid_until: req.valid_until,
+                notes: req.notes.clone(),
+                created_by: principal.wallet.clone(),
+            })
+            .await
+            .map_err(|err| {
+                ApiError::bad_request(format!("create redemption code failed: {err}"))
+            })?;
+        insert_admin_audit(
+            &state,
+            &principal,
+            "redemption_code.create",
+            "redemption_code",
+            Some(row.id.to_string()),
+            None,
+            Some(&row),
+        )
+        .await?;
+        items.push(row);
+    }
+
+    Ok(Json(RedemptionCodeListResponse { items }))
+}
+
+pub async fn get_redemption_code(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<RedemptionCodeRow>, ApiError> {
+    require_viewer(&headers, &state).await?;
+    let row = state
+        .db
+        .get_redemption_code_detail(id)
+        .await
+        .map_err(|err| ApiError::internal(format!("get redemption code failed: {err}")))?
+        .ok_or_else(|| ApiError::not_found("redemption code not found"))?;
+
+    Ok(Json(row))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateRedemptionCodeRequest {
+    pub status: Option<String>,
+    pub ticket_level: Option<i64>,
+    pub valid_from: Option<i64>,
+    pub valid_until: Option<i64>,
+    pub notes: Option<String>,
+}
+
+pub async fn update_redemption_code(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateRedemptionCodeRequest>,
+) -> Result<Json<RedemptionCodeRow>, ApiError> {
+    let principal = authenticate_admin(&state, &headers).await?;
+    require_role(&principal, &[AdminRole::Operator])?;
+    if let Some(status) = req.status.as_deref() {
+        validate_redemption_status(status)?;
+    }
+    if let Some(ticket_level) = req.ticket_level {
+        validate_ticket_level(ticket_level)?;
+    }
+    let before = state
+        .db
+        .get_redemption_code_detail(id)
+        .await
+        .map_err(|err| ApiError::internal(format!("get redemption code failed: {err}")))?
+        .ok_or_else(|| ApiError::not_found("redemption code not found"))?;
+    if before.status == "redeemed" {
+        return Err(ApiError::bad_request("redeemed codes cannot be edited"));
+    }
+
+    let row = state
+        .db
+        .update_redemption_code(
+            id,
+            UpdateRedemptionCode {
+                status: req.status,
+                ticket_level: req.ticket_level,
+                valid_from: req.valid_from,
+                valid_until: req.valid_until,
+                notes: req.notes,
+                updated_by: principal.wallet.clone(),
+            },
+        )
+        .await
+        .map_err(|err| ApiError::internal(format!("update redemption code failed: {err}")))?
+        .ok_or_else(|| ApiError::not_found("redemption code not found"))?;
+
+    insert_admin_audit(
+        &state,
+        &principal,
+        "redemption_code.update",
+        "redemption_code",
+        Some(row.id.to_string()),
+        Some(&before),
+        Some(&row),
+    )
+    .await?;
+
+    Ok(Json(row))
+}
+
+pub async fn pause_redemption_code(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<RedemptionCodeRow>, ApiError> {
+    set_redemption_code_status(state, headers, id, "paused", "redemption_code.pause").await
+}
+
+pub async fn activate_redemption_code(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<RedemptionCodeRow>, ApiError> {
+    set_redemption_code_status(state, headers, id, "active", "redemption_code.activate").await
+}
+
+pub async fn get_redemption_code_stats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<RedemptionCodeStatsRow>, ApiError> {
+    require_viewer(&headers, &state).await?;
+    let row =
+        state.db.get_redemption_code_stats().await.map_err(|err| {
+            ApiError::internal(format!("get redemption code stats failed: {err}"))
+        })?;
+    Ok(Json(row))
+}
+
+pub async fn list_redemption_code_claims(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<RedemptionClaimListResponse>, ApiError> {
+    require_viewer(&headers, &state).await?;
+    let items = state
+        .db
+        .list_redemption_code_claims(None, query.page.unwrap_or(1), query.page_size.unwrap_or(50))
+        .await
+        .map_err(|err| ApiError::internal(format!("list redemption claims failed: {err}")))?;
+    Ok(Json(RedemptionClaimListResponse { items }))
+}
+
+pub async fn list_redemption_code_claims_for_code(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<RedemptionClaimListResponse>, ApiError> {
+    require_viewer(&headers, &state).await?;
+    let items = state
+        .db
+        .list_redemption_code_claims(
+            Some(id),
+            query.page.unwrap_or(1),
+            query.page_size.unwrap_or(50),
+        )
+        .await
+        .map_err(|err| ApiError::internal(format!("list redemption claims failed: {err}")))?;
+    Ok(Json(RedemptionClaimListResponse { items }))
+}
+
 pub async fn list_referral_bindings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1128,12 +1476,85 @@ async fn set_discount_code_status(
     Ok(Json(row))
 }
 
+async fn set_redemption_code_status(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    id: i64,
+    status: &str,
+    action: &str,
+) -> Result<Json<RedemptionCodeRow>, ApiError> {
+    let principal = authenticate_admin(&state, &headers).await?;
+    require_role(&principal, &[AdminRole::Operator])?;
+    let before = state
+        .db
+        .get_redemption_code_detail(id)
+        .await
+        .map_err(|err| ApiError::internal(format!("get redemption code failed: {err}")))?
+        .ok_or_else(|| ApiError::not_found("redemption code not found"))?;
+    if before.status == "redeemed" {
+        return Err(ApiError::bad_request("redeemed codes cannot change status"));
+    }
+    let row = state
+        .db
+        .set_redemption_code_status(id, status, &principal.wallet)
+        .await
+        .map_err(|err| ApiError::internal(format!("set redemption code status failed: {err}")))?
+        .ok_or_else(|| ApiError::not_found("redemption code not found"))?;
+
+    insert_admin_audit(
+        &state,
+        &principal,
+        action,
+        "redemption_code",
+        Some(row.id.to_string()),
+        Some(&before),
+        Some(&row),
+    )
+    .await?;
+
+    Ok(Json(row))
+}
+
 fn validate_promotion_status(status: &str) -> Result<(), ApiError> {
     if matches!(status, "active" | "paused" | "expired" | "exhausted") {
         return Ok(());
     }
 
     Err(ApiError::bad_request("invalid promotion code status"))
+}
+
+fn validate_redemption_status(status: &str) -> Result<(), ApiError> {
+    if matches!(status, "active" | "paused" | "expired") {
+        return Ok(());
+    }
+
+    Err(ApiError::bad_request("invalid redemption code status"))
+}
+
+fn validate_ticket_level(ticket_level: i64) -> Result<(), ApiError> {
+    if matches!(ticket_level, 1 | 2 | 3) {
+        return Ok(());
+    }
+
+    Err(ApiError::bad_request("ticket level must be 1, 2, or 3"))
+}
+
+fn generate_redemption_code(prefix: &str) -> String {
+    let alphabet = SAFE_PROMOTION_CODE_ALPHABET.as_bytes();
+    let mut code = prefix.to_string();
+    let target_len = (prefix.len() + PROMOTION_CODE_MIN_LEN)
+        .clamp(PROMOTION_CODE_MIN_LEN, PROMOTION_CODE_MAX_LEN);
+    while code.len() < target_len {
+        let random = uuid::Uuid::new_v4();
+        for byte in random.as_bytes() {
+            if code.len() >= target_len {
+                break;
+            }
+            let index = *byte as usize % alphabet.len();
+            code.push(alphabet[index] as char);
+        }
+    }
+    code
 }
 
 fn normalize_optional_wallet_address(value: Option<&str>) -> Result<Option<String>, ApiError> {
@@ -2378,6 +2799,167 @@ mod tests {
             .await
             .expect("audit count should succeed");
         assert_eq!(audit_count, 3);
+    }
+
+    #[tokio::test]
+    async fn admin_redemption_codes_operator_can_create_bulk_list_and_toggle() {
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let (app, state) = build_test_app(vec![admin_config(wallet, "operator")]).await;
+        let token = admin_token(&state, wallet, "operator");
+
+        let (status, created) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes",
+            Some(&token),
+            Some(json!({
+                "code": "GUESTV23",
+                "status": "active",
+                "ticket_level": 3,
+                "notes": "vip guest"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(created["code_normalized"], "GUESTV23");
+        assert_eq!(created["ticket_level"], 3);
+
+        let (status, bulk) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/bulk",
+            Some(&token),
+            Some(json!({
+                "prefix": "STD",
+                "count": 3,
+                "ticket_level": 1,
+                "status": "active",
+                "notes": "batch guests"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let bulk_items = bulk["items"].as_array().expect("items array");
+        assert_eq!(bulk_items.len(), 3);
+        let bulk_codes: std::collections::HashSet<_> = bulk_items
+            .iter()
+            .map(|item| item["code_normalized"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(bulk_codes.len(), 3);
+        assert!(bulk_codes.iter().all(|code| code.starts_with("STD")));
+        assert!(bulk_codes.iter().all(|code| code.len() == 11));
+
+        let id = created["id"].as_i64().expect("id should exist");
+        let (status, paused) = json_request(
+            &app,
+            Method::POST,
+            &format!("/redemption-codes/{id}/pause"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(paused["status"], "paused");
+
+        let (status, updated) = json_request(
+            &app,
+            Method::PATCH,
+            &format!("/redemption-codes/{id}"),
+            Some(&token),
+            Some(json!({ "ticket_level": 2, "notes": "changed" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["ticket_level"], 2);
+        assert_eq!(updated["notes"], "changed");
+
+        let (status, list_body) =
+            json_request(&app, Method::GET, "/redemption-codes", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list_body["items"].as_array().expect("items array").len(), 4);
+
+        let audit_count = state
+            .db
+            .count_admin_audit_logs_for_target("redemption_code", &id.to_string())
+            .await
+            .expect("audit count should succeed");
+        assert_eq!(audit_count, 3);
+    }
+
+    #[tokio::test]
+    async fn admin_redemption_codes_viewer_can_read_stats_and_claims() {
+        let operator_wallet = "0x1111111111111111111111111111111111111111";
+        let viewer_wallet = "0x2222222222222222222222222222222222222222";
+        let (app, state) = build_test_app(vec![
+            admin_config(operator_wallet, "operator"),
+            admin_config(viewer_wallet, "viewer"),
+        ])
+        .await;
+        let operator_token = admin_token(&state, operator_wallet, "operator");
+        let viewer_token = admin_token(&state, viewer_wallet, "viewer");
+
+        let (status, created) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes",
+            Some(&operator_token),
+            Some(json!({
+                "code": "READCHM2",
+                "status": "active",
+                "ticket_level": 1
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let code_id = created["id"].as_i64().expect("id should exist");
+        let claim_result = state
+            .db
+            .redeem_redemption_code("READCHM2", "email", "guest@example.com")
+            .await
+            .expect("redeem should succeed")
+            .expect("redeem should create claim");
+
+        let (status, stats) = json_request(
+            &app,
+            Method::GET,
+            "/redemption-codes/stats",
+            Some(&viewer_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stats["redeemed_count"], 1);
+        assert_eq!(stats["level_1_count"], 1);
+
+        let (status, claims) = json_request(
+            &app,
+            Method::GET,
+            "/redemption-codes/claims",
+            Some(&viewer_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(claims["items"][0]["code_normalized"], "READCHM2");
+        assert_eq!(claims["items"][0]["claimant"], "guest@example.com");
+        assert_eq!(claims["items"][0]["ticket_id"], claim_result.ticket.id);
+
+        let (status, code_claims) = json_request(
+            &app,
+            Method::GET,
+            &format!("/redemption-codes/{code_id}/claims"),
+            Some(&viewer_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            code_claims["items"]
+                .as_array()
+                .expect("items should be array")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

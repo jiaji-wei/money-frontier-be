@@ -327,6 +327,87 @@ pub struct NewDiscountCode {
 }
 
 #[derive(Debug, Clone)]
+pub struct NewRedemptionCode {
+    pub code: String,
+    pub status: String,
+    pub ticket_level: i64,
+    pub valid_from: Option<i64>,
+    pub valid_until: Option<i64>,
+    pub notes: Option<String>,
+    pub created_by: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateRedemptionCode {
+    pub status: Option<String>,
+    pub ticket_level: Option<i64>,
+    pub valid_from: Option<i64>,
+    pub valid_until: Option<i64>,
+    pub notes: Option<String>,
+    pub updated_by: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct RedemptionCodeRow {
+    pub id: i64,
+    pub code_normalized: String,
+    pub status: String,
+    pub ticket_level: i64,
+    pub valid_from: Option<i64>,
+    pub valid_until: Option<i64>,
+    pub notes: Option<String>,
+    pub created_by: String,
+    pub updated_by: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct RedemptionCodeStatsRow {
+    pub total_count: i64,
+    pub active_count: i64,
+    pub paused_count: i64,
+    pub redeemed_count: i64,
+    pub expired_count: i64,
+    pub level_1_count: i64,
+    pub level_2_count: i64,
+    pub level_3_count: i64,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct RedemptionClaimRow {
+    pub id: String,
+    pub code_id: i64,
+    pub claimant_type: String,
+    pub claimant: String,
+    pub ticket_id: String,
+    pub order_row_id: i64,
+    pub status: String,
+    pub claimed_at: i64,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct AdminRedemptionClaimRow {
+    pub id: String,
+    pub code_id: i64,
+    pub code_normalized: String,
+    pub ticket_level: i64,
+    pub claimant_type: String,
+    pub claimant: String,
+    pub ticket_id: String,
+    pub order_row_id: i64,
+    pub status: String,
+    pub claimed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RedemptionClaimResult {
+    pub code: RedemptionCodeRow,
+    pub claim: RedemptionClaimRow,
+    pub ticket: TicketRow,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewFiatCheckoutSession {
     pub id: String,
     pub email: String,
@@ -1571,6 +1652,495 @@ ExpiresAt: {expires_at}"
         }
 
         self.get_discount_code_detail(id).await
+    }
+
+    pub async fn create_redemption_code(
+        &self,
+        input: NewRedemptionCode,
+    ) -> anyhow::Result<RedemptionCodeRow> {
+        let now_ts = unix_now();
+        let normalized = normalize_promotion_code(&input.code)
+            .ok_or_else(|| anyhow::anyhow!("code is required"))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO redemption_codes (
+                code_normalized,
+                status,
+                ticket_level,
+                valid_from,
+                valid_until,
+                notes,
+                created_by,
+                updated_by,
+                created_at,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?8)
+            "#,
+        )
+        .bind(&normalized)
+        .bind(input.status)
+        .bind(input.ticket_level)
+        .bind(input.valid_from)
+        .bind(input.valid_until)
+        .bind(input.notes)
+        .bind(input.created_by)
+        .bind(now_ts)
+        .execute(&self.pool)
+        .await?;
+
+        self.find_redemption_code(&normalized)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("redemption code should exist after insert"))
+    }
+
+    pub async fn find_redemption_code(
+        &self,
+        code: &str,
+    ) -> anyhow::Result<Option<RedemptionCodeRow>> {
+        let Some(normalized) = normalize_promotion_code(code) else {
+            return Ok(None);
+        };
+
+        let row = sqlx::query_as::<_, RedemptionCodeRow>(
+            r#"
+            SELECT
+                id,
+                code_normalized,
+                status,
+                ticket_level,
+                valid_from,
+                valid_until,
+                notes,
+                created_by,
+                updated_by,
+                created_at,
+                updated_at
+            FROM redemption_codes
+            WHERE code_normalized = ?1
+            "#,
+        )
+        .bind(normalized)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn get_redemption_code_detail(
+        &self,
+        id: i64,
+    ) -> anyhow::Result<Option<RedemptionCodeRow>> {
+        let row = sqlx::query_as::<_, RedemptionCodeRow>(
+            r#"
+            SELECT
+                id,
+                code_normalized,
+                status,
+                ticket_level,
+                valid_from,
+                valid_until,
+                notes,
+                created_by,
+                updated_by,
+                created_at,
+                updated_at
+            FROM redemption_codes
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn list_redemption_codes(
+        &self,
+        page: i64,
+        page_size: i64,
+    ) -> anyhow::Result<Vec<RedemptionCodeRow>> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 200);
+        let offset = (page - 1) * page_size;
+        let rows = sqlx::query_as::<_, RedemptionCodeRow>(
+            r#"
+            SELECT
+                id,
+                code_normalized,
+                status,
+                ticket_level,
+                valid_from,
+                valid_until,
+                notes,
+                created_by,
+                updated_by,
+                created_at,
+                updated_at
+            FROM redemption_codes
+            ORDER BY id DESC
+            LIMIT ?1 OFFSET ?2
+            "#,
+        )
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    pub async fn get_redemption_code_stats(&self) -> anyhow::Result<RedemptionCodeStatsRow> {
+        let row = sqlx::query_as::<_, RedemptionCodeStatsRow>(
+            r#"
+            SELECT
+                COUNT(1) AS total_count,
+                COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) AS active_count,
+                COALESCE(SUM(CASE WHEN status = 'paused' THEN 1 ELSE 0 END), 0) AS paused_count,
+                COALESCE((SELECT COUNT(1) FROM redemption_claims), 0) AS redeemed_count,
+                COALESCE(SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END), 0) AS expired_count,
+                COALESCE(SUM(CASE WHEN ticket_level = 1 THEN 1 ELSE 0 END), 0) AS level_1_count,
+                COALESCE(SUM(CASE WHEN ticket_level = 2 THEN 1 ELSE 0 END), 0) AS level_2_count,
+                COALESCE(SUM(CASE WHEN ticket_level = 3 THEN 1 ELSE 0 END), 0) AS level_3_count
+            FROM redemption_codes
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn update_redemption_code(
+        &self,
+        id: i64,
+        input: UpdateRedemptionCode,
+    ) -> anyhow::Result<Option<RedemptionCodeRow>> {
+        let now_ts = unix_now();
+        let result = sqlx::query(
+            r#"
+            UPDATE redemption_codes
+            SET status = COALESCE(?2, status),
+                ticket_level = COALESCE(?3, ticket_level),
+                valid_from = COALESCE(?4, valid_from),
+                valid_until = COALESCE(?5, valid_until),
+                notes = COALESCE(?6, notes),
+                updated_by = ?7,
+                updated_at = ?8
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .bind(input.status)
+        .bind(input.ticket_level)
+        .bind(input.valid_from)
+        .bind(input.valid_until)
+        .bind(input.notes)
+        .bind(input.updated_by)
+        .bind(now_ts)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get_redemption_code_detail(id).await
+    }
+
+    pub async fn set_redemption_code_status(
+        &self,
+        id: i64,
+        status: &str,
+        updated_by: &str,
+    ) -> anyhow::Result<Option<RedemptionCodeRow>> {
+        let now_ts = unix_now();
+        let result = sqlx::query(
+            r#"
+            UPDATE redemption_codes
+            SET status = ?2,
+                updated_by = ?3,
+                updated_at = ?4
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .bind(status)
+        .bind(updated_by)
+        .bind(now_ts)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get_redemption_code_detail(id).await
+    }
+
+    pub async fn list_redemption_code_claims(
+        &self,
+        code_id: Option<i64>,
+        page: i64,
+        page_size: i64,
+    ) -> anyhow::Result<Vec<AdminRedemptionClaimRow>> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 200);
+        let offset = (page - 1) * page_size;
+        let mut qb = QueryBuilder::new(
+            r#"
+            SELECT
+                rc.id,
+                rc.code_id,
+                c.code_normalized,
+                c.ticket_level,
+                rc.claimant_type,
+                rc.claimant,
+                rc.ticket_id,
+                rc.order_row_id,
+                rc.status,
+                rc.claimed_at
+            FROM redemption_claims rc
+            JOIN redemption_codes c ON c.id = rc.code_id
+            WHERE 1 = 1
+            "#,
+        );
+        if let Some(code_id) = code_id {
+            qb.push(" AND rc.code_id = ");
+            qb.push_bind(code_id);
+        }
+        qb.push(" ORDER BY rc.claimed_at DESC, rc.id DESC LIMIT ");
+        qb.push_bind(page_size);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
+
+        let rows = qb
+            .build_query_as::<AdminRedemptionClaimRow>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows)
+    }
+
+    pub async fn redeem_redemption_code(
+        &self,
+        code: &str,
+        claimant_type: &str,
+        claimant: &str,
+    ) -> anyhow::Result<Option<RedemptionClaimResult>> {
+        anyhow::ensure!(
+            matches!(claimant_type, "wallet" | "email"),
+            "invalid redemption claimant type"
+        );
+        let Some(normalized) = normalize_promotion_code(code) else {
+            return Ok(None);
+        };
+        let now_ts = unix_now();
+        let mut tx = self.pool.begin().await?;
+
+        let Some(code_row) = sqlx::query_as::<_, RedemptionCodeRow>(
+            r#"
+            SELECT
+                id,
+                code_normalized,
+                status,
+                ticket_level,
+                valid_from,
+                valid_until,
+                notes,
+                created_by,
+                updated_by,
+                created_at,
+                updated_at
+            FROM redemption_codes
+            WHERE code_normalized = ?1
+            "#,
+        )
+        .bind(&normalized)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        if code_row.status != "active"
+            || code_row
+                .valid_from
+                .is_some_and(|valid_from| valid_from > now_ts)
+            || code_row
+                .valid_until
+                .is_some_and(|valid_until| valid_until < now_ts)
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        if let Some(existing_claim) = sqlx::query_as::<_, RedemptionClaimRow>(
+            r#"
+            SELECT id, code_id, claimant_type, claimant, ticket_id, order_row_id, status, claimed_at
+            FROM redemption_claims
+            WHERE code_id = ?1
+              AND claimant_type = ?2
+              AND claimant = ?3
+            LIMIT 1
+            "#,
+        )
+        .bind(code_row.id)
+        .bind(claimant_type)
+        .bind(claimant)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let ticket = sqlx::query_as::<_, TicketRow>(
+                r#"
+                SELECT id, chain_id, order_id, owner_wallet, owner_email, ticket_level, unit_price, qr_payload, qr_version, status, created_at, updated_at
+                FROM tickets
+                WHERE id = ?1
+                "#,
+            )
+            .bind(&existing_claim.ticket_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+
+            return Ok(Some(RedemptionClaimResult {
+                code: code_row,
+                claim: existing_claim,
+                ticket,
+            }));
+        }
+
+        let claim_id = Uuid::new_v4().to_string();
+        let order_id = format!("redeem:{claim_id}");
+        let tx_hash = order_id.clone();
+        sqlx::query(
+            r#"
+            INSERT INTO orders (
+                chain_id,
+                tx_hash,
+                log_index,
+                block_number,
+                block_hash,
+                order_id,
+                buyer_address,
+                payment_token,
+                total_amount,
+                created_at
+            ) VALUES (0, ?1, 0, 0, 'redemption', ?2, ?3, 'redemption', '0', ?4)
+            "#,
+        )
+        .bind(&tx_hash)
+        .bind(&order_id)
+        .bind(claimant)
+        .bind(now_ts)
+        .execute(&mut *tx)
+        .await?;
+
+        let order_row_id: i64 = sqlx::query_scalar("SELECT id FROM orders WHERE tx_hash = ?1")
+            .bind(&tx_hash)
+            .fetch_one(&mut *tx)
+            .await?;
+        let ticket_id = Uuid::new_v4().to_string();
+        let qr_payload = format!(
+            "money-frontier:qr:{}:1:{}",
+            ticket_id,
+            Uuid::new_v4().simple()
+        );
+        let (owner_wallet, owner_email) = match claimant_type {
+            "wallet" => (Some(claimant), None),
+            "email" => (None, Some(claimant)),
+            _ => unreachable!("claimant_type was checked"),
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO tickets (
+                id,
+                chain_id,
+                order_id,
+                source_order_row_id,
+                owner_wallet,
+                owner_email,
+                ticket_level,
+                unit_price,
+                qr_payload,
+                qr_version,
+                status,
+                created_at,
+                updated_at
+            ) VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, '0', ?7, 1, 'active', ?8, ?8)
+            "#,
+        )
+        .bind(&ticket_id)
+        .bind(&order_id)
+        .bind(order_row_id)
+        .bind(owner_wallet)
+        .bind(owner_email)
+        .bind(code_row.ticket_level)
+        .bind(&qr_payload)
+        .bind(now_ts)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO redemption_claims (
+                id,
+                code_id,
+                claimant_type,
+                claimant,
+                ticket_id,
+                order_row_id,
+                status,
+                claimed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'claimed', ?7)
+            "#,
+        )
+        .bind(&claim_id)
+        .bind(code_row.id)
+        .bind(claimant_type)
+        .bind(claimant)
+        .bind(&ticket_id)
+        .bind(order_row_id)
+        .bind(now_ts)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        let code = self
+            .get_redemption_code_detail(code_row.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("redeemed code should exist"))?;
+        let claim = sqlx::query_as::<_, RedemptionClaimRow>(
+            r#"
+            SELECT id, code_id, claimant_type, claimant, ticket_id, order_row_id, status, claimed_at
+            FROM redemption_claims
+            WHERE id = ?1
+            "#,
+        )
+        .bind(&claim_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let ticket = sqlx::query_as::<_, TicketRow>(
+            r#"
+            SELECT id, chain_id, order_id, owner_wallet, owner_email, ticket_level, unit_price, qr_payload, qr_version, status, created_at, updated_at
+            FROM tickets
+            WHERE id = ?1
+            "#,
+        )
+        .bind(&ticket_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(Some(RedemptionClaimResult {
+            code,
+            claim,
+            ticket,
+        }))
     }
 
     async fn list_promotion_codes_by_kind(
@@ -3529,7 +4099,7 @@ fn email_access_token_hash(token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Db;
+    use super::{Db, NewRedemptionCode};
     use crate::chain::DecodedPurchase;
 
     #[tokio::test]
@@ -3730,6 +4300,61 @@ mod tests {
         .expect("schema query should succeed");
 
         assert!(columns.contains(&"wallet_address".to_string()));
+    }
+
+    #[tokio::test]
+    async fn redemption_codes_create_list_and_count_stats() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("db should initialize");
+
+        let first = db
+            .create_redemption_code(NewRedemptionCode {
+                code: "VIP23456".to_string(),
+                status: "active".to_string(),
+                ticket_level: 3,
+                valid_from: None,
+                valid_until: None,
+                notes: Some("vip guest".to_string()),
+                created_by: "0x1111111111111111111111111111111111111111".to_string(),
+            })
+            .await
+            .expect("redemption code should create");
+        assert_eq!(first.code_normalized, "VIP23456");
+        assert_eq!(first.status, "active");
+        assert_eq!(first.ticket_level, 3);
+
+        db.create_redemption_code(NewRedemptionCode {
+            code: "STD23456".to_string(),
+            status: "paused".to_string(),
+            ticket_level: 1,
+            valid_from: None,
+            valid_until: None,
+            notes: None,
+            created_by: "0x1111111111111111111111111111111111111111".to_string(),
+        })
+        .await
+        .expect("second redemption code should create");
+
+        let rows = db
+            .list_redemption_codes(1, 20)
+            .await
+            .expect("redemption codes should list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].code_normalized, "STD23456");
+        assert_eq!(rows[1].code_normalized, "VIP23456");
+
+        let stats = db
+            .get_redemption_code_stats()
+            .await
+            .expect("redemption stats should load");
+        assert_eq!(stats.total_count, 2);
+        assert_eq!(stats.active_count, 1);
+        assert_eq!(stats.paused_count, 1);
+        assert_eq!(stats.redeemed_count, 0);
+        assert_eq!(stats.expired_count, 0);
+        assert_eq!(stats.level_1_count, 1);
+        assert_eq!(stats.level_3_count, 1);
     }
 
     #[tokio::test]
