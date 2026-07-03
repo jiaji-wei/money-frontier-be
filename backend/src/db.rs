@@ -331,6 +331,7 @@ pub struct NewRedemptionCode {
     pub code: String,
     pub status: String,
     pub ticket_level: i64,
+    pub max_claims: i64,
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
     pub notes: Option<String>,
@@ -341,6 +342,7 @@ pub struct NewRedemptionCode {
 pub struct UpdateRedemptionCode {
     pub status: Option<String>,
     pub ticket_level: Option<i64>,
+    pub max_claims: Option<i64>,
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
     pub notes: Option<String>,
@@ -353,6 +355,8 @@ pub struct RedemptionCodeRow {
     pub code_normalized: String,
     pub status: String,
     pub ticket_level: i64,
+    pub max_claims: i64,
+    pub claim_count: i64,
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
     pub notes: Option<String>,
@@ -1668,6 +1672,7 @@ ExpiresAt: {expires_at}"
                 code_normalized,
                 status,
                 ticket_level,
+                max_claims,
                 valid_from,
                 valid_until,
                 notes,
@@ -1675,12 +1680,13 @@ ExpiresAt: {expires_at}"
                 updated_by,
                 created_at,
                 updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?8)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?9)
             "#,
         )
         .bind(&normalized)
         .bind(input.status)
         .bind(input.ticket_level)
+        .bind(input.max_claims)
         .bind(input.valid_from)
         .bind(input.valid_until)
         .bind(input.notes)
@@ -1709,6 +1715,8 @@ ExpiresAt: {expires_at}"
                 code_normalized,
                 status,
                 ticket_level,
+                max_claims,
+                (SELECT COUNT(1) FROM redemption_claims WHERE code_id = redemption_codes.id) AS claim_count,
                 valid_from,
                 valid_until,
                 notes,
@@ -1738,6 +1746,8 @@ ExpiresAt: {expires_at}"
                 code_normalized,
                 status,
                 ticket_level,
+                max_claims,
+                (SELECT COUNT(1) FROM redemption_claims WHERE code_id = redemption_codes.id) AS claim_count,
                 valid_from,
                 valid_until,
                 notes,
@@ -1771,6 +1781,8 @@ ExpiresAt: {expires_at}"
                 code_normalized,
                 status,
                 ticket_level,
+                max_claims,
+                (SELECT COUNT(1) FROM redemption_claims WHERE code_id = redemption_codes.id) AS claim_count,
                 valid_from,
                 valid_until,
                 notes,
@@ -1823,17 +1835,19 @@ ExpiresAt: {expires_at}"
             UPDATE redemption_codes
             SET status = COALESCE(?2, status),
                 ticket_level = COALESCE(?3, ticket_level),
-                valid_from = COALESCE(?4, valid_from),
-                valid_until = COALESCE(?5, valid_until),
-                notes = COALESCE(?6, notes),
-                updated_by = ?7,
-                updated_at = ?8
+                max_claims = COALESCE(?4, max_claims),
+                valid_from = COALESCE(?5, valid_from),
+                valid_until = COALESCE(?6, valid_until),
+                notes = COALESCE(?7, notes),
+                updated_by = ?8,
+                updated_at = ?9
             WHERE id = ?1
             "#,
         )
         .bind(id)
         .bind(input.status)
         .bind(input.ticket_level)
+        .bind(input.max_claims)
         .bind(input.valid_from)
         .bind(input.valid_until)
         .bind(input.notes)
@@ -1946,6 +1960,8 @@ ExpiresAt: {expires_at}"
                 code_normalized,
                 status,
                 ticket_level,
+                max_claims,
+                (SELECT COUNT(1) FROM redemption_claims WHERE code_id = redemption_codes.id) AS claim_count,
                 valid_from,
                 valid_until,
                 notes,
@@ -2011,6 +2027,22 @@ ExpiresAt: {expires_at}"
                 claim: existing_claim,
                 ticket,
             }));
+        }
+
+        let claim_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(1)
+            FROM redemption_claims
+            WHERE code_id = ?1
+            "#,
+        )
+        .bind(code_row.id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if claim_count >= code_row.max_claims {
+            tx.rollback().await?;
+            anyhow::bail!("redemption code claim limit reached");
         }
 
         let claim_id = Uuid::new_v4().to_string();
@@ -4313,6 +4345,7 @@ mod tests {
                 code: "VIP23456".to_string(),
                 status: "active".to_string(),
                 ticket_level: 3,
+                max_claims: 1,
                 valid_from: None,
                 valid_until: None,
                 notes: Some("vip guest".to_string()),
@@ -4323,11 +4356,13 @@ mod tests {
         assert_eq!(first.code_normalized, "VIP23456");
         assert_eq!(first.status, "active");
         assert_eq!(first.ticket_level, 3);
+        assert_eq!(first.max_claims, 1);
 
         db.create_redemption_code(NewRedemptionCode {
             code: "STD23456".to_string(),
             status: "paused".to_string(),
             ticket_level: 1,
+            max_claims: 5,
             valid_from: None,
             valid_until: None,
             notes: None,

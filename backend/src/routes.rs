@@ -1042,7 +1042,7 @@ pub async fn redeem_redemption_code(
         .db
         .redeem_redemption_code(&req.code, claimant_type, &claimant)
         .await
-        .map_err(|err| ApiError::internal(format!("redeem code failed: {err}")))?;
+        .map_err(map_redemption_error)?;
 
     let result = result.ok_or_else(|| ApiError::bad_request("redemption code is not active"))?;
 
@@ -1062,7 +1062,7 @@ pub async fn redeem_redemption_code_by_email(
         .db
         .redeem_redemption_code(&req.code, "email", &email)
         .await
-        .map_err(|err| ApiError::internal(format!("redeem code failed: {err}")))?;
+        .map_err(map_redemption_error)?;
 
     let result = result.ok_or_else(|| ApiError::bad_request("redemption code is not active"))?;
 
@@ -1071,6 +1071,13 @@ pub async fn redeem_redemption_code_by_email(
         claim_id: result.claim.id,
         ticket: result.ticket.into(),
     }))
+}
+
+fn map_redemption_error(err: anyhow::Error) -> ApiError {
+    if err.to_string() == "redemption code claim limit reached" {
+        return ApiError::bad_request("redemption code claim limit reached");
+    }
+    ApiError::internal(format!("redeem code failed: {err}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2138,6 +2145,7 @@ mod tests {
                 code: "VIPFREE1".to_string(),
                 status: "active".to_string(),
                 ticket_level: 3,
+                max_claims: 1,
                 valid_from: None,
                 valid_until: None,
                 notes: None,
@@ -2189,6 +2197,7 @@ mod tests {
                 code: "EMAILVIP".to_string(),
                 status: "active".to_string(),
                 ticket_level: 2,
+                max_claims: 1,
                 valid_from: None,
                 valid_until: None,
                 notes: None,
@@ -2246,6 +2255,7 @@ mod tests {
                 code: "SHAREVIP".to_string(),
                 status: "active".to_string(),
                 ticket_level: 3,
+                max_claims: 2,
                 valid_from: None,
                 valid_until: None,
                 notes: None,
@@ -2308,6 +2318,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_email_redeem_rejects_new_claimants_after_max_claims() {
+        let mock_chain = Arc::new(MockChain::default());
+        let (app, state) = build_test_app(mock_chain).await;
+        state
+            .db
+            .create_redemption_code(NewRedemptionCode {
+                code: "ONCEONLY".to_string(),
+                status: "active".to_string(),
+                ticket_level: 1,
+                max_claims: 1,
+                valid_from: None,
+                valid_until: None,
+                notes: None,
+                created_by: "admin".to_string(),
+            })
+            .await
+            .expect("redemption code should create");
+
+        let (first_status, first_body) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/redeem-by-email",
+            None,
+            Some(json!({
+                "code": "ONCEONLY",
+                "email": "first@example.com"
+            })),
+        )
+        .await;
+        let (duplicate_status, duplicate_body) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/redeem-by-email",
+            None,
+            Some(json!({
+                "code": "ONCEONLY",
+                "email": "FIRST@example.com"
+            })),
+        )
+        .await;
+        let (second_status, second_body) = json_request(
+            &app,
+            Method::POST,
+            "/redemption-codes/redeem-by-email",
+            None,
+            Some(json!({
+                "code": "ONCEONLY",
+                "email": "second@example.com"
+            })),
+        )
+        .await;
+
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(duplicate_status, StatusCode::OK);
+        assert_eq!(duplicate_body["claim_id"], first_body["claim_id"]);
+        assert_eq!(second_status, StatusCode::BAD_REQUEST);
+        assert_eq!(second_body["error"], "redemption code claim limit reached");
+
+        let code = state
+            .db
+            .find_redemption_code("ONCEONLY")
+            .await
+            .expect("code lookup should succeed")
+            .expect("code should exist");
+        let claims = state
+            .db
+            .list_redemption_code_claims(Some(code.id), 1, 10)
+            .await
+            .expect("claims should load");
+        assert_eq!(claims.len(), 1);
+    }
+
+    #[tokio::test]
     async fn public_email_redeem_is_idempotent_for_same_code_and_email() {
         let mock_chain = Arc::new(MockChain::default());
         let (app, state) = build_test_app(mock_chain).await;
@@ -2317,6 +2400,7 @@ mod tests {
                 code: "IDEMPOT".to_string(),
                 status: "active".to_string(),
                 ticket_level: 1,
+                max_claims: 1,
                 valid_from: None,
                 valid_until: None,
                 notes: None,

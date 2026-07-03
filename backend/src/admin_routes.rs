@@ -746,6 +746,7 @@ pub struct CreateRedemptionCodeRequest {
     pub code: String,
     pub status: Option<String>,
     pub ticket_level: i64,
+    pub max_claims: Option<i64>,
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
     pub notes: Option<String>,
@@ -759,6 +760,7 @@ pub async fn create_redemption_code(
     let principal = authenticate_admin(&state, &headers).await?;
     require_role(&principal, &[AdminRole::Operator])?;
     validate_ticket_level(req.ticket_level)?;
+    let max_claims = validate_redemption_max_claims(req.max_claims.unwrap_or(1))?;
     let status = req.status.unwrap_or_else(|| "active".to_string());
     validate_redemption_status(&status)?;
     let code = normalize_new_promotion_code(&req.code).map_err(ApiError::bad_request)?;
@@ -780,6 +782,7 @@ pub async fn create_redemption_code(
             code,
             status,
             ticket_level: req.ticket_level,
+            max_claims,
             valid_from: req.valid_from,
             valid_until: req.valid_until,
             notes: req.notes,
@@ -807,6 +810,7 @@ pub struct BulkCreateRedemptionCodesRequest {
     pub prefix: Option<String>,
     pub count: i64,
     pub ticket_level: i64,
+    pub max_claims: Option<i64>,
     pub status: Option<String>,
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
@@ -821,6 +825,7 @@ pub async fn bulk_create_redemption_codes(
     let principal = authenticate_admin(&state, &headers).await?;
     require_role(&principal, &[AdminRole::Operator])?;
     validate_ticket_level(req.ticket_level)?;
+    let max_claims = validate_redemption_max_claims(req.max_claims.unwrap_or(1))?;
     if !(1..=500).contains(&req.count) {
         return Err(ApiError::bad_request("bulk count must be within 1..=500"));
     }
@@ -874,6 +879,7 @@ pub async fn bulk_create_redemption_codes(
                 code,
                 status: status.clone(),
                 ticket_level: req.ticket_level,
+                max_claims,
                 valid_from: req.valid_from,
                 valid_until: req.valid_until,
                 notes: req.notes.clone(),
@@ -919,6 +925,7 @@ pub async fn get_redemption_code(
 pub struct UpdateRedemptionCodeRequest {
     pub status: Option<String>,
     pub ticket_level: Option<i64>,
+    pub max_claims: Option<i64>,
     pub valid_from: Option<i64>,
     pub valid_until: Option<i64>,
     pub notes: Option<String>,
@@ -938,6 +945,9 @@ pub async fn update_redemption_code(
     if let Some(ticket_level) = req.ticket_level {
         validate_ticket_level(ticket_level)?;
     }
+    if let Some(max_claims) = req.max_claims {
+        validate_redemption_max_claims(max_claims)?;
+    }
     let before = state
         .db
         .get_redemption_code_detail(id)
@@ -955,6 +965,7 @@ pub async fn update_redemption_code(
             UpdateRedemptionCode {
                 status: req.status,
                 ticket_level: req.ticket_level,
+                max_claims: req.max_claims,
                 valid_from: req.valid_from,
                 valid_until: req.valid_until,
                 notes: req.notes,
@@ -1529,6 +1540,16 @@ fn validate_redemption_status(status: &str) -> Result<(), ApiError> {
     }
 
     Err(ApiError::bad_request("invalid redemption code status"))
+}
+
+fn validate_redemption_max_claims(max_claims: i64) -> Result<i64, ApiError> {
+    if (1..=100_000).contains(&max_claims) {
+        return Ok(max_claims);
+    }
+
+    Err(ApiError::bad_request(
+        "redemption code max claims must be within 1..=100000",
+    ))
 }
 
 fn validate_ticket_level(ticket_level: i64) -> Result<(), ApiError> {
@@ -2816,6 +2837,7 @@ mod tests {
                 "code": "GUESTV23",
                 "status": "active",
                 "ticket_level": 3,
+                "max_claims": 25,
                 "notes": "vip guest"
             })),
         )
@@ -2823,6 +2845,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(created["code_normalized"], "GUESTV23");
         assert_eq!(created["ticket_level"], 3);
+        assert_eq!(created["max_claims"], 25);
 
         let (status, bulk) = json_request(
             &app,
@@ -2833,6 +2856,7 @@ mod tests {
                 "prefix": "STD",
                 "count": 3,
                 "ticket_level": 1,
+                "max_claims": 2,
                 "status": "active",
                 "notes": "batch guests"
             })),
@@ -2848,6 +2872,7 @@ mod tests {
         assert_eq!(bulk_codes.len(), 3);
         assert!(bulk_codes.iter().all(|code| code.starts_with("STD")));
         assert!(bulk_codes.iter().all(|code| code.len() == 11));
+        assert!(bulk_items.iter().all(|item| item["max_claims"] == 2));
 
         let id = created["id"].as_i64().expect("id should exist");
         let (status, paused) = json_request(
@@ -2866,11 +2891,12 @@ mod tests {
             Method::PATCH,
             &format!("/redemption-codes/{id}"),
             Some(&token),
-            Some(json!({ "ticket_level": 2, "notes": "changed" })),
+            Some(json!({ "ticket_level": 2, "max_claims": 10, "notes": "changed" })),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(updated["ticket_level"], 2);
+        assert_eq!(updated["max_claims"], 10);
         assert_eq!(updated["notes"], "changed");
 
         let (status, list_body) =
